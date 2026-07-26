@@ -22,6 +22,8 @@ sudo apt-get update && sudo apt-get install -y git ca-certificates curl && git c
 
 脚本会自动检查并安装缺失依赖，包括 Docker Engine、Docker Compose 插件、Git、curl、openssl 等；随后生成 `.env`、构建镜像、执行迁移并启动服务。
 
+安装完成后，机器人会主动给 `SUPER_ADMIN_IDS` 里的超级管理员发送部署完成通知。以后执行 `bash scripts/linux/update.sh` 更新完成后，也会主动发送更新完成通知。
+
 安装过程中会询问三项：
 
 - **机器人 Bot Token**：从 Telegram 的 BotFather 获取。
@@ -82,6 +84,20 @@ Set-ExecutionPolicy -Scope Process Bypass
 /start
 /余额
 ```
+
+超级管理员请私聊机器人发送：
+
+```text
+/start
+```
+
+或：
+
+```text
+/menu
+```
+
+机器人会显示中文按钮菜单，包括运行状态、群管理、玩法说明和部署命令。
 
 下注示例：
 

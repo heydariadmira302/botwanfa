@@ -148,6 +148,11 @@ write_env_file
 start_stack
 
 log "安装完成。查看状态：bash scripts/linux/status.sh"
+INSTALL_MESSAGE="✅ BOTWANFA 部署完成
+服务器：$(hostname)
+目录：$ROOT_DIR
+查看状态：bash scripts/linux/status.sh"
+bash scripts/linux/notify_admins.sh "$INSTALL_MESSAGE" || true
 if [ "${DOCKER[0]}" = "sudo" ]; then
   log "提示：当前使用 sudo 运行 Docker。重新登录服务器后，通常可以直接使用 docker 命令。"
 fi

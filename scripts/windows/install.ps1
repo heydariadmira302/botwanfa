@@ -80,4 +80,5 @@ New-Item -ItemType Directory -Force -Path 'backups' | Out-Null
 docker compose build
 docker compose up -d
 docker compose ps
+& (Join-Path $PSScriptRoot 'notify_admins.ps1') -Message "✅ BOTWANFA 部署完成`n服务器：$env:COMPUTERNAME`n目录：$(Get-Location)`n查看状态：scripts/windows/status.ps1"
 Write-Host 'Install complete. Diagnostics: scripts/windows/status.ps1'
