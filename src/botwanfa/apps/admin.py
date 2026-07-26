@@ -37,6 +37,7 @@ from botwanfa.db.models import (
     WalletLedger,
     WinningStreak,
 )
+from botwanfa.presentation import rules_text
 
 router = Router(name="super_admin")
 PAGE_SIZE = 8
@@ -1117,21 +1118,26 @@ async def admin_callback(
         await _show(query, text, InlineKeyboardMarkup(inline_keyboard=[_home_button()]))
     elif action == "pub":
         group_id = int(parts[2])
-        rules = (
-            "📖 三骰玩法说明\n\n"
-            "大/小：和值3-10为小，11-18为大\n"
-            "单/双：按和值奇偶判断\n"
-            "组合：dd大单、ds大双、xd小单、xs小双\n"
-            "特殊：和值3-18、顺子、豹子、111至666指定豹子\n\n"
-            "下注示例：大100、dd100、和值 10 100、顺子100、111 100"
-        )
         async with session_factory() as session, session.begin():
+            settings = await session.get(GameSettings, group_id)
+            odds_rows = (
+                await session.scalars(
+                    select(OddsSetting).where(
+                        OddsSetting.group_id == group_id,
+                        OddsSetting.enabled.is_(True),
+                    )
+                )
+            ).all()
+            if settings is None:
+                await query.message.answer("该群配置不存在。")
+                return
+            odds = {(row.bet_type, row.bet_value): row.payout_multiplier for row in odds_rows}
             session.add(
                 OutboxMessage(
                     group_id=group_id,
                     sequence=0,
                     message_type="text",
-                    payload={"text": rules},
+                    payload={"text": rules_text(odds, settings.minimum_bet), "pin": True},
                     idempotency_key=f"admin-rules:{group_id}:{uuid.uuid4().hex}",
                 )
             )

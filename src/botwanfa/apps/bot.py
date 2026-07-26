@@ -18,6 +18,7 @@ from botwanfa.db.models import (
     DailyCheckin,
     DiceResult,
     GameSettings,
+    OddsSetting,
     Round,
     User,
     Wallet,
@@ -27,6 +28,7 @@ from botwanfa.db.session import create_engine_and_session
 from botwanfa.domain.bets import BetParseError, parse_bets
 from botwanfa.domain.state_machine import RoundStatus
 from botwanfa.logging import configure_logging
+from botwanfa.presentation import bet_item_text, rules_text, success_bet_text
 from botwanfa.services.betting import BettingError, BettingService
 from botwanfa.services.provisioning import provision_participant
 
@@ -68,12 +70,14 @@ async def ensure_participant(message: Message, session_factory) -> None:
 async def start(message: Message, session_factory) -> None:
     await ensure_participant(message, session_factory)
     await message.reply(
-        "\u673a\u5668\u4eba\u5df2\u8fd0\u884c\u3002\u5f00\u76d8\u540e\u53ef\u53d1\u9001\uff1a"
-        "\u5927100\u3001dd100\u3001\u548c\u503c 10 100\u3001\u987a\u5b50100\u3001111 100\u3002"
+        "<b>BOTWANFA 已连接本群</b>\n\n"
+        "机器人会自动开盘、封盘、发送三颗原生骰子、生成走势图并结算。\n"
+        "发送 /玩法 查看完整规则，发送 余额、签到、日榜、周榜或月榜查询个人数据。",
+        parse_mode=ParseMode.HTML,
     )
 
 
-@router.message(Command("balance", "\u4f59\u989d"))
+@router.message(Command("balance", "余额", "我的"))
 async def balance(message: Message, session_factory) -> None:
     user = message.from_user
     if user is None or message.chat.type not in GROUP_TYPES:
@@ -86,7 +90,44 @@ async def balance(message: Message, session_factory) -> None:
                 Wallet.user_id == user.id,
             )
         )
-    await message.reply(f"\u5f53\u524d\u4f59\u989d\uff1a{wallet.balance if wallet else 0.00}")
+    mention = f'<a href="tg://user?id={user.id}">{escape(user.full_name)}</a>'
+    await message.reply(
+        f"💰 {mention}（ID: <code>{user.id}</code>）\n"
+        f"当前余额：<b>{wallet.balance if wallet else 0.00}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def send_rules(message: Message, session_factory) -> None:
+    await ensure_participant(message, session_factory)
+    async with session_factory() as session:
+        settings = await session.get(GameSettings, message.chat.id)
+        odds_rows = (
+            await session.scalars(
+                select(OddsSetting).where(
+                    OddsSetting.group_id == message.chat.id,
+                    OddsSetting.enabled.is_(True),
+                )
+            )
+        ).all()
+    if settings is None:
+        await message.reply("本群配置尚未建立，请先发送 /start。")
+        return
+    odds = {(row.bet_type, row.bet_value): row.payout_multiplier for row in odds_rows}
+    await message.reply(
+        rules_text(odds, settings.minimum_bet),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("rules", "玩法", "规则"), F.chat.type.in_(GROUP_TYPES))
+async def rules_command(message: Message, session_factory) -> None:
+    await send_rules(message, session_factory)
+
+
+@router.message(Command("checkin", "签到"), F.chat.type.in_(GROUP_TYPES))
+async def checkin_command(message: Message, session_factory) -> None:
+    await process_checkin(message, session_factory)
 
 
 def failure_message(user, *, item: str = "", reason: str) -> str:
@@ -192,12 +233,19 @@ async def send_group_ranking(message: Message, session_factory, period: str) -> 
     await message.reply(text, parse_mode=ParseMode.HTML)
 
 
+@router.message(Command("日榜", "周榜", "月榜"), F.chat.type.in_(GROUP_TYPES))
+async def ranking_command(message: Message, session_factory) -> None:
+    command = (message.text or "").split("@", 1)[0].lstrip("/")
+    period = {"日榜": "day", "周榜": "week", "月榜": "month"}.get(command)
+    if period:
+        await send_group_ranking(message, session_factory, period)
+
+
 @router.message(F.chat.type.in_(GROUP_TYPES), F.dice)
 async def collect_player_dice(message: Message, session_factory) -> None:
     user = message.from_user
     if user is None or message.dice is None or message.dice.emoji != "🎲":
         return
-    completed = False
     async with session_factory() as session, session.begin():
         round_ = await session.scalar(
             select(Round)
@@ -213,7 +261,13 @@ async def collect_player_dice(message: Message, session_factory) -> None:
         if int(snapshot.get("player_dice_user_id", 0)) != user.id:
             return
         deadline_text = snapshot.get("player_dice_deadline")
-        deadline = datetime.fromisoformat(deadline_text) if deadline_text else datetime.now(UTC)
+        if deadline_text:
+            deadline = datetime.fromisoformat(deadline_text)
+        else:
+            deadline = datetime.now(UTC) + timedelta(
+                seconds=int(snapshot.get("player_dice_seconds", 10))
+            )
+            snapshot["player_dice_deadline"] = deadline.isoformat()
         if deadline <= datetime.now(UTC):
             return
         message_ids = list(snapshot.get("player_dice_message_ids", []))
@@ -240,15 +294,18 @@ async def collect_player_dice(message: Message, session_factory) -> None:
                     )
                 )
             round_.status = RoundStatus.SETTLING.value
-            completed = True
-    if completed:
-        await message.reply("✅ 三颗骰子已收齐，本期进入结算。")
 
 
 @router.message(F.chat.type.in_(GROUP_TYPES), F.text)
 async def group_text(message: Message, session_factory) -> None:
     text = message.text or ""
     command = text.strip().lower()
+    if command in {"玩法", "规则"}:
+        await send_rules(message, session_factory)
+        return
+    if command in {"余额", "我的"}:
+        await balance(message, session_factory)
+        return
     if command in {"签到", "qd"}:
         await process_checkin(message, session_factory)
         return
@@ -288,8 +345,17 @@ async def group_text(message: Message, session_factory) -> None:
         return
     if not result.duplicate:
         await message.reply(
-            f"\u2705 \u6295\u6ce8\u5df2\u53d7\u7406\uff0c\u5408\u8ba1 {result.total_amount}\uff0c"
-            f"\u4f59\u989d {result.balance_after}"
+            success_bet_text(
+                display_name=user.full_name,
+                user_id=user.id,
+                items=(
+                    bet_item_text(item.bet_type.value, item.value or "", item.amount)
+                    for item in items
+                ),
+                total=result.total_amount,
+                balance=result.balance_after,
+            ),
+            parse_mode=ParseMode.HTML,
         )
 
 

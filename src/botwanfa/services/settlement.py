@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -138,40 +138,25 @@ class SettlementService:
             settlements.append(settlement)
         round_.status = RoundStatus.COMPLETED.value
         round_.completed_at = datetime.now(UTC)
-        labels = [
-            "\u5927" if outcome.is_big else "\u5c0f",
-            "\u5355" if outcome.is_odd else "\u53cc",
-        ]
-        if outcome.is_straight:
-            labels.append("\u987a\u5b50")
-        if outcome.is_triple:
-            labels.append("\u8c79\u5b50")
-        player_lines = [
-            (
-                f"ID {item.user_id}\uff1a\u6295\u6ce8 {item.wagered}\uff0c"
-                f"\u8fd4\u8fd8 {item.returned}\uff0c\u51c0\u8f93\u8d62 {item.net}\uff0c"
-                f"\u4f59\u989d {item.balance_after}"
-            )
-            for item in settlements
-        ]
+        available_at = datetime.now(UTC) + timedelta(seconds=4)
         session.add(
             OutboxMessage(
                 group_id=round_.group_id,
-                sequence=4,
-                message_type="text",
-                payload={
-                    "text": (
-                        f"\u7b2c {round_.round_number} \u671f\u5f00\u5956\uff1a"
-                        f"{dice.die_1}-{dice.die_2}-{dice.die_3}\uff0c"
-                        f"\u548c\u503c {outcome.total}\uff0c{'/'.join(labels)}\n"
-                        + (
-                            "\n".join(player_lines)
-                            if player_lines
-                            else "\u672c\u671f\u65e0\u6295\u6ce8"
-                        )
-                    )
-                },
+                sequence=40,
+                message_type="trend_result",
+                payload={"round_id": round_id, "round_number": round_.round_number},
+                idempotency_key=f"round:{round_id}:trend-result",
+                available_at=available_at,
+            )
+        )
+        session.add(
+            OutboxMessage(
+                group_id=round_.group_id,
+                sequence=50,
+                message_type="settlement_summary",
+                payload={"round_id": round_id, "round_number": round_.round_number},
                 idempotency_key=f"round:{round_id}:settlement-summary",
+                available_at=available_at,
             )
         )
         await session.flush()

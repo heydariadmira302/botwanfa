@@ -69,6 +69,14 @@ async def tick(session_factory) -> None:
                     .order_by(Round.round_number.desc())
                     .limit(1)
                 )
+                unsent = await session.scalar(
+                    select(func.count(OutboxMessage.id)).where(
+                        OutboxMessage.group_id == group.id,
+                        OutboxMessage.status.in_(("pending", "processing")),
+                    )
+                )
+                if unsent:
+                    continue
                 next_round_seconds = (
                     min(settings.next_round_seconds, 5)
                     if settings.test_mode
@@ -100,6 +108,15 @@ async def tick(session_factory) -> None:
                     settings_snapshot={
                         "minimum_bet": str(settings.minimum_bet),
                         "betting_seconds": betting_seconds,
+                        "rolling_seconds": settings.rolling_seconds,
+                        "next_round_seconds": settings.next_round_seconds,
+                        "player_dice_seconds": settings.player_dice_seconds,
+                        "player_dice_threshold": (
+                            str(settings.player_dice_threshold)
+                            if settings.player_dice_threshold is not None
+                            else None
+                        ),
+                        "history_size": settings.history_size,
                         "test_mode": settings.test_mode,
                     },
                 )
@@ -108,10 +125,13 @@ async def tick(session_factory) -> None:
                 session.add(
                     OutboxMessage(
                         group_id=group.id,
-                        sequence=1,
-                        message_type="text",
+                        sequence=10,
+                        message_type="round_open",
                         payload={
-                            "text": f"🎲 第 {round_.round_number} 期开始下注，时间 {betting_seconds} 秒。"
+                            "round_id": round_.id,
+                            "round_number": round_.round_number,
+                            "betting_seconds": betting_seconds,
+                            "minimum_bet": str(settings.minimum_bet),
                         },
                         idempotency_key=f"round:{round_.id}:open",
                     )
@@ -125,13 +145,14 @@ async def tick(session_factory) -> None:
                 session.add(
                     OutboxMessage(
                         group_id=group.id,
-                        sequence=2,
-                        message_type="text",
-                        payload={"text": f"🔒 第 {active.round_number} 期已封盘。"},
+                        sequence=20,
+                        message_type="round_closed",
+                        payload={"round_id": active.id, "round_number": active.round_number},
                         idempotency_key=f"round:{active.id}:closed",
                     )
                 )
-                if settings.player_dice_threshold is not None:
+                threshold_text = active.settings_snapshot.get("player_dice_threshold")
+                if threshold_text is not None:
                     batches = (
                         await session.scalars(
                             select(BetBatch)
@@ -139,46 +160,52 @@ async def tick(session_factory) -> None:
                             .order_by(BetBatch.created_at, BetBatch.id)
                         )
                     ).all()
-                    candidate = choose_player_dice_candidate(
-                        batches, settings.player_dice_threshold
-                    )
+                    candidate = choose_player_dice_candidate(batches, Decimal(threshold_text))
                     if candidate is not None:
+                        configured_player_seconds = int(
+                            active.settings_snapshot.get(
+                                "player_dice_seconds", settings.player_dice_seconds
+                            )
+                        )
                         player_seconds = (
-                            min(settings.player_dice_seconds, 5)
-                            if settings.test_mode
-                            else settings.player_dice_seconds
+                            min(configured_player_seconds, 5)
+                            if active.settings_snapshot.get("test_mode")
+                            else configured_player_seconds
                         )
                         active.status = RoundStatus.WAITING_FOR_PLAYER_DICE.value
                         active.settings_snapshot = {
                             **active.settings_snapshot,
                             "player_dice_user_id": candidate,
-                            "player_dice_deadline": (now + timedelta(seconds=player_seconds)).isoformat(),
+                            "player_dice_seconds": player_seconds,
+                            "player_dice_deadline": None,
                             "player_dice_values": [],
                             "player_dice_message_ids": [],
                         }
                         session.add(
                             OutboxMessage(
                                 group_id=group.id,
-                                sequence=3,
-                                message_type="text",
+                                sequence=25,
+                                message_type="player_dice_invite",
                                 payload={
-                                    "text": (
-                                        f"🎲 玩家 ID {candidate} 已达到本期掷骰门槛，"
-                                        f"请在 {player_seconds} 秒内发送三颗原生骰子。"
-                                    )
+                                    "round_id": active.id,
+                                    "round_number": active.round_number,
+                                    "user_id": candidate,
+                                    "seconds": player_seconds,
                                 },
                                 idempotency_key=f"round:{active.id}:player-dice-invite",
                             )
                         )
             elif active.status == RoundStatus.WAITING_FOR_PLAYER_DICE.value:
                 deadline_text = active.settings_snapshot.get("player_dice_deadline")
-                deadline = datetime.fromisoformat(deadline_text) if deadline_text else now
+                if not deadline_text:
+                    continue
+                deadline = datetime.fromisoformat(deadline_text)
                 if deadline <= now:
                     active.status = RoundStatus.BOT_ROLLING.value
                     session.add(
                         OutboxMessage(
                             group_id=group.id,
-                            sequence=4,
+                            sequence=30,
                             message_type="dice_round",
                             payload={"round_id": active.id, "round_number": active.round_number},
                             idempotency_key=f"round:{active.id}:dice",
@@ -190,9 +217,20 @@ async def tick(session_factory) -> None:
                 and active.betting_closes_at
                 + timedelta(
                     seconds=(
-                        min(settings.rolling_seconds, 3)
-                        if settings.test_mode
-                        else settings.rolling_seconds
+                        min(
+                            int(
+                                active.settings_snapshot.get(
+                                    "rolling_seconds", settings.rolling_seconds
+                                )
+                            ),
+                            3,
+                        )
+                        if active.settings_snapshot.get("test_mode")
+                        else int(
+                            active.settings_snapshot.get(
+                                "rolling_seconds", settings.rolling_seconds
+                            )
+                        )
                     )
                 )
                 <= now
@@ -201,7 +239,7 @@ async def tick(session_factory) -> None:
                 session.add(
                     OutboxMessage(
                         group_id=group.id,
-                        sequence=3,
+                        sequence=30,
                         message_type="dice_round",
                         payload={"round_id": active.id, "round_number": active.round_number},
                         idempotency_key=f"round:{active.id}:dice",
