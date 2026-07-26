@@ -37,7 +37,7 @@ from botwanfa.db.models import (
     WalletLedger,
     WinningStreak,
 )
-from botwanfa.presentation import rules_text
+from botwanfa.presentation import TREND_MAX_POINTS, TREND_MIN_POINTS, rules_text
 
 router = Router(name="super_admin")
 PAGE_SIZE = 8
@@ -320,7 +320,9 @@ async def _group_view(session_factory, group_id: int) -> tuple[str, InlineKeyboa
         f"下注/封盘开奖/下一局：{settings.betting_seconds}s / "
         f"{settings.rolling_seconds}s / {settings.next_round_seconds}s\n"
         f"最低下注：{settings.minimum_bet}  ·  玩家掷骰门槛：{threshold_text}\n"
-        f"走势期数：{settings.history_size}  ·  测试模式：{test_text}"
+        "走势期数："
+        f"{min(max(settings.history_size, TREND_MIN_POINTS), TREND_MAX_POINTS)}"
+        f"  ·  测试模式：{test_text}"
     )
     toggle = "▶️ 恢复运行" if group.paused else "⏸ 暂停运行"
     markup = InlineKeyboardMarkup(
@@ -523,14 +525,20 @@ async def _data_view(session_factory, group_id: int) -> tuple[str, InlineKeyboar
         settings = await session.get(GameSettings, group_id)
     if group is None or settings is None:
         return await _group_view(session_factory, group_id)
+    visible_history = min(max(settings.history_size, TREND_MIN_POINTS), TREND_MAX_POINTS)
+    legacy_note = (
+        f"\n旧配置为 {settings.history_size} 期，当前自动按 {visible_history} 期展示。"
+        if settings.history_size != visible_history
+        else ""
+    )
     text = (
         f"<b>📈 {escape(group.title)} · 走势与数据</b>\n\n"
-        f"走势图显示最近 <b>{settings.history_size}</b> 期。\n"
-        "报表按当前群独立统计。"
+        f"走势图滚动显示最近 <b>{visible_history}</b> 期，期号持续累计，不会从头铺到当前期。"
+        f"{legacy_note}\n报表按当前群独立统计。"
     )
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
-            [_button("28期", f"a:hs:{group_id}:28"), _button("84期", f"a:hs:{group_id}:84"), _button("168期", f"a:hs:{group_id}:168")],
+            [_button("28期", f"a:hs:{group_id}:28"), _button("56期", f"a:hs:{group_id}:56"), _button("84期", f"a:hs:{group_id}:84")],
             [_button("✏️ 自定义走势期数", f"a:i:{group_id}:history")],
             [_button("📊 查看群报表", f"a:rp:{group_id}"), _button("🏆 查看排行榜", f"a:r:{group_id}:day")],
             [_button("⬅️ 返回群控制台", f"a:g:{group_id}")],
@@ -1121,7 +1129,8 @@ async def admin_callback(
     elif action == "d":
         await _show(query, *(await _data_view(session_factory, int(parts[2]))))
     elif action == "hs":
-        group_id, value = int(parts[2]), int(parts[3])
+        group_id = int(parts[2])
+        value = min(max(int(parts[3]), TREND_MIN_POINTS), TREND_MAX_POINTS)
         async with session_factory() as session, session.begin():
             settings = await session.get(GameSettings, group_id, with_for_update=True)
             if settings:
@@ -1294,7 +1303,10 @@ async def admin_callback(
             "cmin": ("签到最小值", "大于等于0，最多两位小数"),
             "cmax": ("签到最大值", "大于等于0，最多两位小数"),
             "cstep": ("签到步进", "大于0，最多两位小数"),
-            "history": ("走势期数", "28 至 280 的整数"),
+            "history": (
+                "走势期数",
+                f"{TREND_MIN_POINTS} 至 {TREND_MAX_POINTS} 的整数；始终只展示最近这些期",
+            ),
             "streak": ("连胜奖励档位", "格式：3=10,5=30,10=100"),
         }
         if kind in {"bs", "rs", "ns", "ps"}:
@@ -1384,8 +1396,10 @@ async def admin_setting_input(message: Message, session_factory, state: FSMConte
             elif kind in {"bs", "rs", "ns", "ps", "history"}:
                 value = int(raw)
                 if kind == "history":
-                    if not 28 <= value <= 280:
-                        raise ValueError("走势期数范围为28至280")
+                    if not TREND_MIN_POINTS <= value <= TREND_MAX_POINTS:
+                        raise ValueError(
+                            f"走势期数范围为{TREND_MIN_POINTS}至{TREND_MAX_POINTS}"
+                        )
                     field = "history_size"
                 else:
                     if not 1 <= value <= 3600:

@@ -22,6 +22,9 @@ RED = (218, 72, 65)
 GOLD = (230, 184, 92)
 CYAN = (83, 179, 178)
 GREEN = (73, 176, 121)
+TREND_MIN_POINTS = 14
+TREND_MAX_POINTS = 84
+TREND_COLUMNS = 7
 
 FONT_CANDIDATES = (
     os.environ.get("CJK_FONT", ""),
@@ -94,6 +97,51 @@ def money(value: Decimal | int | str) -> str:
     return f"{Decimal(value):,.2f}"
 
 
+def round_code(round_number: int) -> str:
+    return str(round_number).zfill(6)
+
+
+def player_mention(user_id: int, display_name: str) -> str:
+    label = display_name.strip() or f"玩家 {user_id}"
+    if len(label) > 16:
+        label = label[:15] + "…"
+    return f'<a href="tg://user?id={user_id}">{escape(label)}</a>'
+
+
+def player_mention_chunks(
+    players: Sequence[tuple[int, str]], *, max_length: int = 900
+) -> list[str]:
+    prefix = "<b>🔔 本期下注玩家</b>\n"
+    if max_length <= len(prefix) + 50:
+        raise ValueError("mention chunk limit is too small")
+    chunks: list[str] = []
+    current = prefix
+    for user_id, display_name in players:
+        mention = player_mention(user_id, display_name)
+        separator = "" if current == prefix else "、"
+        if current != prefix and len(current) + len(separator) + len(mention) > max_length:
+            chunks.append(current)
+            current = prefix + mention
+        else:
+            current += separator + mention
+    if current != prefix:
+        chunks.append(current)
+    return chunks
+
+
+def result_notification_parts(
+    caption: str,
+    players: Sequence[tuple[int, str]],
+    *,
+    caption_limit: int = 1000,
+    message_limit: int = 3500,
+) -> tuple[str, list[str]]:
+    mention_messages = player_mention_chunks(players, max_length=message_limit)
+    if len(mention_messages) == 1 and len(caption) + len(mention_messages[0]) + 2 <= caption_limit:
+        return f"{caption}\n\n{mention_messages[0]}", []
+    return caption, mention_messages
+
+
 def bet_label(bet_type: str, bet_value: str = "") -> str:
     label = BET_LABELS.get(bet_type, bet_type)
     return f"{label}{bet_value}" if bet_value else label
@@ -118,14 +166,14 @@ def open_caption(
     *, round_number: int, betting_seconds: int, minimum_bet: Decimal
 ) -> str:
     return (
-        f"期号：<code>{str(round_number).zfill(6)}</code>\n\n"
-        f"🇨🇳 底注：<b>{money(minimum_bet)}</b>　下注时间：<b>{betting_seconds} 秒</b>\n\n"
-        "<b>文字下注格式：</b>\n"
+        f"<b>第 <code>{round_code(round_number)}</code> 期 · 开始下注</b>\n"
+        f"⏳ {betting_seconds} 秒　最低下注 <b>{money(minimum_bet)}</b>\n\n"
+        "<b>下注格式</b>\n"
         "大小单双：<code>大100　小100　单100　双100</code>\n"
         "组合：<code>dd100　ds100　xd100　xs100</code>\n"
         "和值：<code>和值 10 100</code>\n"
         "特殊：<code>顺子100　豹子100　111 100</code>\n\n"
-        "一条消息可发送多项投注，任一项目有误则整条不扣分。"
+        "可在一条消息中发送多项；任一项有误，整条不扣分。"
     )
 
 
@@ -134,7 +182,7 @@ def closed_caption(
 ) -> str:
     return (
         "<b>🚫 停止下注，等待掷骰子</b>\n"
-        f"期号：<code>{str(round_number).zfill(6)}</code>\n"
+        f"期号：<code>{round_code(round_number)}</code>\n"
         f"参与玩家：{player_count} 人　投注项目：{bet_count} 项\n"
         f"本期总流水：<b>{money(turnover)}</b>"
     )
@@ -150,7 +198,7 @@ def closed_bet_text(
 ) -> str:
     lines = [
         "<b>🚫 停止下注，等待掷骰子</b>",
-        f"期号：<code>{str(round_number).zfill(6)}</code>",
+        f"期号：<code>{round_code(round_number)}</code>",
         f"本期下注玩家：{len(rows)} 人　投注项目：{bet_count} 项",
         f"本期总流水：<b>{money(turnover)}</b>",
     ]
@@ -183,7 +231,7 @@ def result_caption(round_number: int, outcome: DiceOutcome, source: str) -> str:
         else "机器人掷骰"
     )
     return (
-        f"<b>第 {round_number} 期 · 开奖结果</b>\n"
+        f"<b>🎯 第 <code>{round_code(round_number)}</code> 期 · 开奖结果</b>\n"
         f"点数：<b>{outcome.dice[0]} - {outcome.dice[1]} - {outcome.dice[2]}</b>　"
         f"和值：<b>{outcome.total}</b>\n"
         f"命中：<b>{' / '.join(labels)}</b>\n"
@@ -192,17 +240,28 @@ def result_caption(round_number: int, outcome: DiceOutcome, source: str) -> str:
 
 
 def settlement_text(round_number: int, rows: Sequence[SettlementSummary]) -> str:
-    lines = [f"<b>第 {round_number} 期 · 全部玩家结算</b>"]
+    lines = [f"<b>💰 第 <code>{round_code(round_number)}</code> 期 · 结算完成</b>"]
     if not rows:
         lines.append("\n本期无人投注。")
         return "\n".join(lines)
+    total_wagered = sum((row.wagered for row in rows), Decimal("0.00"))
+    total_returned = sum((row.returned for row in rows), Decimal("0.00"))
+    total_net = total_returned - total_wagered
+    net_sign = "+" if total_net > 0 else ""
+    lines.extend(
+        (
+            f"参与 {len(rows)} 人　投注 <b>{money(total_wagered)}</b>　返还 <b>{money(total_returned)}</b>",
+            f"玩家合计净输赢：<b>{net_sign}{money(total_net)}</b>",
+        )
+    )
     for index, row in enumerate(rows, 1):
         reward = f"　连胜奖励 +{money(row.streak_reward)}" if row.streak_reward > 0 else ""
         sign = "+" if row.net > 0 else ""
+        state = "🟢" if row.net > 0 else ("🔴" if row.net < 0 else "⚪")
         lines.extend(
             (
                 "",
-                f"{index}. {escape(row.display_name)}（ID: <code>{row.user_id}</code>）",
+                f"{index}. {state} {escape(row.display_name)}（ID: <code>{row.user_id}</code>）",
                 (
                     f"投注 {money(row.wagered)}　返还 {money(row.returned)}　"
                     f"净输赢 <b>{sign}{money(row.net)}</b>{reward}"
@@ -210,17 +269,6 @@ def settlement_text(round_number: int, rows: Sequence[SettlementSummary]) -> str
                 f"最终余额 <b>{money(row.balance)}</b>",
             )
         )
-    total_wagered = sum((row.wagered for row in rows), Decimal("0.00"))
-    total_returned = sum((row.returned for row in rows), Decimal("0.00"))
-    lines.extend(
-        (
-            "",
-            (
-                f"本期合计：投注 {money(total_wagered)}　返还 {money(total_returned)}　"
-                f"净输赢 {money(total_returned - total_wagered)}"
-            ),
-        )
-    )
     return "\n".join(lines)
 
 
@@ -372,7 +420,7 @@ def render_bet_summary_pages(
         draw = ImageDraw.Draw(image)
         _header(
             draw,
-            title=f"第 {round_number} 期  停止下注",
+            title=f"第 {round_code(round_number)} 期  停止下注",
             subtitle=(
                 f"共 {len(rows)} 位玩家  ·  总流水 {money(total_turnover)}  ·  "
                 f"第 {page_index}/{len(pages)} 页"
@@ -421,7 +469,7 @@ def render_settlement_pages(
         draw = ImageDraw.Draw(image)
         _header(
             draw,
-            title=f"第 {round_number} 期  全员结算",
+            title=f"第 {round_code(round_number)} 期  全员结算",
             subtitle=f"投注 / 返还 / 净输赢 / 最终余额  ·  第 {page_index}/{len(chunks)} 页",
             width=width,
             accent=GOLD,
@@ -454,74 +502,82 @@ def render_settlement_pages(
 
 
 def render_trend_image(points: Sequence[TrendPoint], current_round: int) -> bytes:
-    columns = 28
-    visible = list(points)
+    columns = TREND_COLUMNS
+    visible = list(points)[-TREND_MAX_POINTS:]
     row_count = max(1, (len(visible) + columns - 1) // columns)
-    width, height = 1680, 205 + row_count * 194
+    width = 1080
+    start_x = 35
+    start_y = 175
+    gap = 8
+    cell_width = (width - start_x * 2 - gap * (columns - 1)) // columns
+    row_height = 180
+    height = start_y + row_count * row_height + 58
     image = Image.new("RGB", (width, height), CANVAS)
     draw = ImageDraw.Draw(image)
+    first_round = visible[0].round_number if visible else current_round
+    last_round = visible[-1].round_number if visible else current_round
     _header(
         draw,
         title="三骰开奖走势",
-        subtitle=f"最近 {len(points)} 期  ·  当前第 {current_round} 期",
+        subtitle=(
+            f"滚动窗口 {round_code(first_round)}-{round_code(last_round)}"
+            f"  ·  最近 {len(visible)} 期"
+        ),
         width=width,
         accent=RED,
     )
-    cell_width = 56
-    row_height = 194
-    start_x = 50
-    start_y = 175
     for index, point in enumerate(visible):
         row, column = divmod(index, columns)
-        x = start_x + column * cell_width
+        x = start_x + column * (cell_width + gap)
         y = start_y + row * row_height
         is_current = point.round_number == current_round
-        fill = PANEL_ALT if column % 2 else PANEL
-        draw.rectangle((x, y, x + cell_width - 3, y + row_height - 15), fill=fill)
+        fill = PANEL_ALT if (row + column) % 2 else PANEL
+        bottom = y + row_height - 10
+        draw.rounded_rectangle((x, y, x + cell_width, bottom), radius=8, fill=fill)
         if is_current:
-            draw.rectangle((x, y, x + cell_width - 3, y + row_height - 15), outline=RED, width=3)
+            draw.rounded_rectangle(
+                (x, y, x + cell_width, bottom), radius=8, outline=RED, width=4
+            )
         draw.text(
-            (x + cell_width // 2, y + 8),
-            str(point.round_number)[-3:].zfill(3),
-            font=_font(15, True),
+            (x + cell_width // 2, y + 9),
+            round_code(point.round_number),
+            font=_font(19, True),
             fill=GOLD if is_current else MUTED,
             anchor="ma",
         )
+        die_size = 30
+        die_gap = 6
+        dice_width = die_size * 3 + die_gap * 2
+        dice_x = x + (cell_width - dice_width) // 2
         for die_index, value in enumerate(point.dice):
-            _draw_die(draw, x + 6 + die_index * 16, y + 33, 14, value)
+            _draw_die(draw, dice_x + die_index * (die_size + die_gap), y + 38, die_size, value)
         draw.text(
-            (x + cell_width // 2, y + 68),
-            str(point.total),
-            font=_font(24, True),
+            (x + cell_width // 2, y + 82),
+            f"和值 {point.total}",
+            font=_font(22, True),
             fill=WHITE,
             anchor="ma",
         )
+        combination = f"{'大' if point.is_big else '小'}{'单' if point.is_odd else '双'}"
         draw.text(
-            (x + cell_width // 2, y + 103),
-            "大" if point.is_big else "小",
-            font=_font(17, True),
+            (x + cell_width // 2, y + 115),
+            combination,
+            font=_font(24, True),
             fill=RED if point.is_big else CYAN,
             anchor="ma",
         )
+        special = "豹子" if point.is_triple else ("顺子" if point.is_straight else "普通")
         draw.text(
-            (x + cell_width // 2, y + 130),
-            "单" if point.is_odd else "双",
-            font=_font(17, True),
-            fill=GOLD if point.is_odd else GREEN,
-            anchor="ma",
-        )
-        special = "豹" if point.is_triple else ("顺" if point.is_straight else "")
-        draw.text(
-            (x + cell_width // 2, y + 157),
+            (x + cell_width // 2, y + 146),
             special,
-            font=_font(16, True),
-            fill=GOLD,
+            font=_font(18, True),
+            fill=GOLD if point.is_triple or point.is_straight else MUTED,
             anchor="ma",
         )
     draw.text(
-        (50, height - 38),
-        "每格依次显示：期号尾号、三颗骰子、和值、大小、单双、顺子/豹子",
-        font=_font(21),
+        (35, height - 38),
+        "每格：完整期号 / 三颗骰子 / 和值 / 大小单双组合 / 顺子或豹子",
+        font=_font(20),
         fill=MUTED,
     )
     return _png(image)

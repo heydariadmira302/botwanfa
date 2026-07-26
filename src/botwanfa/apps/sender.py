@@ -15,7 +15,7 @@ from aiogram.exceptions import (
     TelegramServerError,
 )
 from aiogram.types import BufferedInputFile, InputMediaPhoto
-from sqlalchemy import exists, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.orm import aliased
 
 from botwanfa.config import get_settings
@@ -34,6 +34,8 @@ from botwanfa.domain.dice import evaluate_dice
 from botwanfa.domain.state_machine import RoundStatus
 from botwanfa.logging import configure_logging
 from botwanfa.presentation import (
+    TREND_MAX_POINTS,
+    TREND_MIN_POINTS,
     BetSummary,
     SettlementSummary,
     TrendPoint,
@@ -46,6 +48,8 @@ from botwanfa.presentation import (
     render_settlement_pages,
     render_trend_image,
     result_caption,
+    result_notification_parts,
+    round_code,
     settlement_text,
 )
 
@@ -285,7 +289,13 @@ async def send_trend_result(
         current_dice = await session.get(DiceResult, round_id)
         if current_round is None or current_dice is None:
             raise RuntimeError("开奖期次或骰子结果不存在")
-        history_size = int(current_round.settings_snapshot.get("history_size", 84))
+        history_size = min(
+            max(
+                int(current_round.settings_snapshot.get("history_size", TREND_MAX_POINTS)),
+                TREND_MIN_POINTS,
+            ),
+            TREND_MAX_POINTS,
+        )
         history = (
             await session.execute(
                 select(Round, DiceResult)
@@ -297,6 +307,15 @@ async def send_trend_result(
                 )
                 .order_by(Round.round_number.desc())
                 .limit(history_size)
+            )
+        ).all()
+        participants = (
+            await session.execute(
+                select(User.id, User.display_name)
+                .join(BetBatch, BetBatch.user_id == User.id)
+                .where(BetBatch.round_id == round_id)
+                .group_by(User.id, User.display_name)
+                .order_by(func.min(BetBatch.created_at), User.id)
             )
         ).all()
     points = []
@@ -317,11 +336,18 @@ async def send_trend_result(
         (current_dice.die_1, current_dice.die_2, current_dice.die_3)
     )
     image = await asyncio.to_thread(render_trend_image, points, round_number)
+    caption = result_caption(round_number, current_outcome, current_dice.source)
+    caption, mention_messages = result_notification_parts(
+        caption,
+        [(user_id, display_name) for user_id, display_name in participants],
+    )
     await bot.send_photo(
         group_id,
         BufferedInputFile(image, filename=f"round-{round_number}-trend.png"),
-        caption=result_caption(round_number, current_outcome, current_dice.source),
+        caption=caption,
     )
+    for mention_text in mention_messages:
+        await bot.send_message(group_id, mention_text)
 
 
 async def load_settlement_summaries(
@@ -370,7 +396,7 @@ async def send_settlement_summary(
         bot,
         group_id,
         pages,
-        caption=f"<b>第 {round_number} 期 · 全部玩家结算</b>",
+        caption=f"<b>第 <code>{round_code(round_number)}</code> 期 · 全部玩家结算</b>",
         filename_prefix=f"round-{round_number}-settlement",
     )
 

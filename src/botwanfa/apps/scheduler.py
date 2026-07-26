@@ -11,6 +11,7 @@ from botwanfa.db.models import BetBatch, GameSettings, OutboxMessage, Round, Tel
 from botwanfa.db.session import create_engine_and_session
 from botwanfa.domain.state_machine import RoundStatus
 from botwanfa.logging import configure_logging
+from botwanfa.presentation import TREND_MAX_POINTS, TREND_MIN_POINTS
 
 log = structlog.get_logger()
 ACTIVE = [
@@ -116,7 +117,9 @@ async def tick(session_factory) -> None:
                             if settings.player_dice_threshold is not None
                             else None
                         ),
-                        "history_size": settings.history_size,
+                        "history_size": min(
+                            max(settings.history_size, TREND_MIN_POINTS), TREND_MAX_POINTS
+                        ),
                         "test_mode": settings.test_mode,
                     },
                 )

@@ -11,10 +11,13 @@ from botwanfa.presentation import (
     closed_bet_text,
     load_status_animation,
     open_caption,
+    player_mention_chunks,
     render_bet_summary_pages,
     render_settlement_pages,
     render_trend_image,
     result_caption,
+    result_notification_parts,
+    round_code,
     rules_text,
     settlement_text,
     success_bet_text,
@@ -30,10 +33,10 @@ def image_size(content: bytes) -> tuple[int, int]:
 
 def test_open_and_success_templates_include_required_details() -> None:
     opened = open_caption(round_number=12, betting_seconds=30, minimum_bet=Decimal(1))
-    assert "期号：<code>000012</code>" in opened
+    assert "第 <code>000012</code> 期" in opened
     assert "30 秒" in opened
     assert "和值 10 100" in opened
-    assert "任一项目有误则整条不扣分" in opened
+    assert "任一项有误，整条不扣分" in opened
 
     accepted = success_bet_text(
         display_name="<测试 & 玩家>",
@@ -53,6 +56,39 @@ def test_result_caption_keeps_triple_independent_results() -> None:
     assert "小 / 单 / 小单" in caption
     assert "豹子" in caption
     assert "指定豹子111" in caption
+
+
+def test_round_codes_remain_unambiguous_after_ten_thousand_rounds() -> None:
+    assert round_code(8) == "000008"
+    assert round_code(10_000) == "010000"
+    assert round_code(1_000_000) == "1000000"
+
+
+def test_player_mentions_are_complete_and_split_below_message_limit() -> None:
+    players = [(1000 + index, f"很长的玩家昵称<{index}>&测试") for index in range(45)]
+    chunks = player_mention_chunks(players, max_length=700)
+    combined = "".join(chunks)
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 700 for chunk in chunks)
+    assert all(f"tg://user?id={user_id}" in combined for user_id, _ in players)
+    assert "&lt;" in combined
+    assert "&amp;" in combined
+
+
+def test_result_mentions_stay_in_caption_for_small_groups_and_split_for_large_groups() -> None:
+    base = result_caption(10_000, evaluate_dice((3, 4, 5)), "bot")
+    caption, messages = result_notification_parts(base, [(1, "玩家甲"), (2, "玩家乙")])
+    assert messages == []
+    assert "tg://user?id=1" in caption
+    assert len(caption) <= 1000
+
+    players = [(1000 + index, f"玩家{index}") for index in range(120)]
+    caption, messages = result_notification_parts(base, players)
+    combined = "".join(messages)
+    assert caption == base
+    assert len(messages) >= 2
+    assert all(len(message) <= 3500 for message in messages)
+    assert all(f"tg://user?id={user_id}" in combined for user_id, _ in players)
 
 
 def test_normal_close_message_keeps_player_bets_in_text() -> None:
@@ -103,7 +139,7 @@ def test_status_and_trend_images_are_valid_png_files() -> None:
     assert image_size(load_status_animation("open")) == (240, 120)
     assert image_size(load_status_animation("closed")) == (240, 120)
     points = []
-    for number in range(1, 85):
+    for number in range(9917, 10001):
         dice = (number % 6 + 1, (number + 1) % 6 + 1, (number + 2) % 6 + 1)
         outcome = evaluate_dice(dice)
         points.append(
@@ -117,7 +153,26 @@ def test_status_and_trend_images_are_valid_png_files() -> None:
                 is_triple=outcome.is_triple,
             )
         )
-    assert image_size(render_trend_image(points, 84)) == (1680, 787)
+    assert image_size(render_trend_image(points, 10000)) == (1080, 2393)
+
+
+def test_trend_image_never_grows_beyond_the_rolling_window() -> None:
+    points = []
+    for number in range(9801, 10001):
+        dice = (number % 6 + 1, (number + 1) % 6 + 1, (number + 2) % 6 + 1)
+        outcome = evaluate_dice(dice)
+        points.append(
+            TrendPoint(
+                round_number=number,
+                dice=dice,
+                total=outcome.total,
+                is_big=outcome.is_big,
+                is_odd=outcome.is_odd,
+                is_straight=outcome.is_straight,
+                is_triple=outcome.is_triple,
+            )
+        )
+    assert image_size(render_trend_image(points, 10000)) == (1080, 2393)
 
 
 def test_long_bet_and_settlement_lists_are_paginated_without_omission() -> None:
