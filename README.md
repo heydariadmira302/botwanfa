@@ -22,6 +22,12 @@ sudo apt-get update && sudo apt-get install -y git ca-certificates curl && git c
 
 脚本会自动检查并安装缺失依赖，包括 Docker Engine、Docker Compose 插件、Git、curl、openssl 等；随后生成 `.env`、构建镜像、执行迁移并启动服务。
 
+安装过程中会询问三项：
+
+- **机器人 Bot Token**：从 Telegram 的 BotFather 获取。
+- **超级管理员 Telegram 数字ID**：这是你的 Telegram 用户数字 ID，不是用户名。可以在 Telegram 里私聊 `@userinfobot` 或 `@RawDataBot` 查询。多个管理员用英文逗号分隔，例如 `123456789,987654321`。
+- **备份加密密钥**：用于加密数据库备份，至少 12 个字符，请自己保存好。
+
 如果已经 clone 过项目，只需：
 
 ```bash

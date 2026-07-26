@@ -5,13 +5,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 log() { printf '\n[botwanfa] %s\n' "$*"; }
-fail() { printf '\n[botwanfa] ERROR: %s\n' "$*" >&2; exit 1; }
+fail() { printf '\n[botwanfa] 错误：%s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 if [ "${EUID:-$(id -u)}" -eq 0 ]; then
   SUDO=()
 else
-  have sudo || fail "sudo is required. Re-run as root or install sudo first."
+  have sudo || fail "需要 sudo。请用 root 运行，或先安装 sudo。"
   SUDO=(sudo)
 fi
 
@@ -20,25 +20,25 @@ export DEBIAN_FRONTEND=noninteractive
 if [ -r /etc/os-release ]; then
   . /etc/os-release
   if [ "${ID:-}" != "ubuntu" ]; then
-    log "This installer is tuned for Ubuntu 24.x; detected ${PRETTY_NAME:-unknown}. Continuing."
+    log "此脚本主要面向 Ubuntu 24.x；当前检测到 ${PRETTY_NAME:-unknown}，继续尝试安装。"
   fi
 else
-  fail "/etc/os-release not found; this installer expects Ubuntu 24.x."
+  fail "没有找到 /etc/os-release；此脚本需要 Ubuntu 24.x 或兼容系统。"
 fi
 
 install_base_packages() {
-  log "Checking and installing base packages..."
+  log "正在检查并安装基础依赖..."
   "${SUDO[@]}" apt-get update
   "${SUDO[@]}" apt-get install -y ca-certificates curl gnupg lsb-release openssl git uidmap
 }
 
 install_docker_official() {
   if have docker && docker compose version >/dev/null 2>&1; then
-    log "Docker and Compose are already installed."
+    log "已安装 Docker 和 Docker Compose。"
     return
   fi
 
-  log "Installing Docker Engine and Compose plugin from the official Docker repository..."
+  log "正在从 Docker 官方仓库安装 Docker Engine 和 Compose 插件..."
   "${SUDO[@]}" install -m 0755 -d /etc/apt/keyrings
   if [ ! -s /etc/apt/keyrings/docker.gpg ]; then
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | "${SUDO[@]}" gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -75,7 +75,7 @@ select_docker_command() {
 }
 
 wait_for_docker() {
-  log "Waiting for Docker engine..."
+  log "正在等待 Docker 引擎启动..."
   select_docker_command
   for _ in $(seq 1 60); do
     if "${DOCKER[@]}" info >/dev/null 2>&1; then
@@ -89,27 +89,28 @@ wait_for_docker() {
   if have journalctl; then
     "${SUDO[@]}" journalctl -u docker --no-pager -n 80 || true
   fi
-  fail "Docker engine did not become ready. Check the log above and re-run this script."
+  fail "Docker 引擎没有正常启动。请查看上方日志，处理后重新运行本脚本。"
 }
 
 write_env_file() {
   if [ -f .env ]; then
-    read -r -p ".env already exists. Recreate it? [y/N]: " RECREATE_ENV
+    read -r -p "检测到已存在 .env，是否重新生成？[y/N]: " RECREATE_ENV
     case "$RECREATE_ENV" in
       y|Y|yes|YES) ;;
-      *) log "Keeping existing .env"; return ;;
+      *) log "保留现有 .env"; return ;;
     esac
   fi
 
-  read -r -s -p "Bot Token: " BOT_TOKEN
+  read -r -s -p "请输入机器人 Bot Token（输入时不显示）： " BOT_TOKEN
   printf '\n'
-  read -r -p "Super admin IDs, comma separated: " SUPER_ADMIN_IDS
-  read -r -s -p "Backup passphrase, at least 12 characters: " BACKUP_PASSPHRASE
+  read -r -p "请输入超级管理员 Telegram 数字ID（多个用英文逗号分隔，例如 123456789,987654321）： " SUPER_ADMIN_IDS
+  read -r -s -p "请输入备份加密密钥（至少12个字符，输入时不显示）： " BACKUP_PASSPHRASE
   printf '\n'
 
-  [ -n "$BOT_TOKEN" ] || fail "Bot Token is empty."
-  [ -n "$SUPER_ADMIN_IDS" ] || fail "Super admin IDs are empty."
-  [ "${#BACKUP_PASSPHRASE}" -ge 12 ] || fail "Backup passphrase must have at least 12 characters."
+  [ -n "$BOT_TOKEN" ] || fail "Bot Token 不能为空。"
+  [ -n "$SUPER_ADMIN_IDS" ] || fail "超级管理员 ID 不能为空。"
+  [[ "$SUPER_ADMIN_IDS" =~ ^[0-9]+(,[0-9]+)*$ ]] || fail "超级管理员 ID 必须是 Telegram 数字ID；多个 ID 请用英文逗号分隔，不能有空格。"
+  [ "${#BACKUP_PASSPHRASE}" -ge 12 ] || fail "备份加密密钥至少需要12个字符。"
 
   POSTGRES_PASSWORD="$(openssl rand -hex 24)"
   REDIS_PASSWORD="$(openssl rand -hex 24)"
@@ -132,11 +133,11 @@ EOF
 
 start_stack() {
   mkdir -p backups
-  log "Building application image..."
+  log "正在构建应用镜像..."
   "${DOCKER[@]}" compose build
-  log "Starting services and running database migration..."
+  log "正在启动服务并执行数据库迁移..."
   "${DOCKER[@]}" compose up -d
-  log "Current service status:"
+  log "当前服务状态："
   "${DOCKER[@]}" compose ps
 }
 
@@ -146,7 +147,7 @@ wait_for_docker
 write_env_file
 start_stack
 
-log "Install complete. Use: bash scripts/linux/status.sh"
+log "安装完成。查看状态：bash scripts/linux/status.sh"
 if [ "${DOCKER[0]}" = "sudo" ]; then
-  log "Tip: log out and back in to use docker without sudo after group membership refresh."
+  log "提示：当前使用 sudo 运行 Docker。重新登录服务器后，通常可以直接使用 docker 命令。"
 fi
