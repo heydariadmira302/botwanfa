@@ -12,14 +12,22 @@
 - `tests/`：核心玩法、结算、消息和备份加密测试。
 - `开发实现说明.md`：当前阶段实现范围、验证方式和后续开发清单。
 
-## Linux 部署
+## Linux 部署（全新 Ubuntu 24）
+
+在新服务器上直接执行：
+
+```bash
+sudo apt-get update && sudo apt-get install -y git ca-certificates curl && git clone https://github.com/heydariadmira302/botwanfa.git && cd botwanfa && bash scripts/linux/install.sh
+```
+
+脚本会自动检查并安装缺失依赖，包括 Docker Engine、Docker Compose 插件、Git、curl、openssl 等；随后生成 `.env`、构建镜像、执行迁移并启动服务。
+
+如果已经 clone 过项目，只需：
 
 ```bash
 cd botwanfa
 bash scripts/linux/install.sh
 ```
-
-脚本会安装 Docker、生成 `.env`、构建镜像、执行迁移并启动服务。
 
 日常命令：
 
