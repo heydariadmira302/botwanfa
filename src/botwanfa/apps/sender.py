@@ -38,11 +38,12 @@ from botwanfa.presentation import (
     SettlementSummary,
     TrendPoint,
     bet_item_text,
+    closed_bet_text,
     closed_caption,
+    load_status_animation,
     open_caption,
     render_bet_summary_pages,
     render_settlement_pages,
-    render_status_banner,
     render_trend_image,
     result_caption,
     settlement_text,
@@ -146,9 +147,9 @@ async def send_round_open(bot: Bot, group_id: int, payload: dict) -> None:
         betting_seconds=int(payload["betting_seconds"]),
         minimum_bet=Decimal(payload["minimum_bet"]),
     )
-    await bot.send_photo(
+    await bot.send_animation(
         group_id,
-        BufferedInputFile(render_status_banner("open"), filename="betting-open.png"),
+        BufferedInputFile(load_status_animation("open"), filename="betting-open.gif"),
         caption=caption,
     )
 
@@ -205,19 +206,45 @@ async def send_round_closed(
     round_id = int(payload["round_id"])
     round_number = int(payload["round_number"])
     summaries, bet_count, turnover = await load_bet_summaries(session_factory, round_id)
-    summary_pages = await asyncio.to_thread(render_bet_summary_pages, round_number, summaries)
-    pages = [render_status_banner("closed"), *summary_pages]
+    async with session_factory() as session:
+        round_ = await session.get(Round, round_id)
+    rolling_seconds = int(
+        (round_.settings_snapshot if round_ else {}).get("rolling_seconds", 10)
+    )
     caption = closed_caption(
         round_number=round_number,
         player_count=len(summaries),
         bet_count=bet_count,
         turnover=turnover,
     )
+    full_text = closed_bet_text(
+        round_number=round_number,
+        rows=summaries,
+        bet_count=bet_count,
+        turnover=turnover,
+        rolling_seconds=rolling_seconds,
+    )
+    if len(full_text) <= 900:
+        await bot.send_animation(
+            group_id,
+            BufferedInputFile(load_status_animation("closed"), filename="betting-closed.gif"),
+            caption=full_text,
+        )
+        return
+    await bot.send_animation(
+        group_id,
+        BufferedInputFile(load_status_animation("closed"), filename="betting-closed.gif"),
+        caption=caption,
+    )
+    if len(full_text) <= 3900:
+        await bot.send_message(group_id, full_text)
+        return
+    summary_pages = await asyncio.to_thread(render_bet_summary_pages, round_number, summaries)
     await send_photo_pages(
         bot,
         group_id,
-        pages,
-        caption=caption,
+        summary_pages,
+        caption="<b>本期下注清单</b>",
         filename_prefix=f"round-{round_number}-closed",
     )
 

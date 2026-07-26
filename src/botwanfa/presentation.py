@@ -118,11 +118,13 @@ def open_caption(
     *, round_number: int, betting_seconds: int, minimum_bet: Decimal
 ) -> str:
     return (
-        f"<b>第 {round_number} 期 · 开始下注</b>\n"
-        f"下注时间：<b>{betting_seconds} 秒</b>　最低下注：<b>{money(minimum_bet)}</b>\n\n"
-        "发送格式：\n"
-        "<code>大100　dd100　和值 10 100</code>\n"
-        "<code>顺子100　豹子100　111 100</code>\n\n"
+        f"期号：<code>{str(round_number).zfill(6)}</code>\n\n"
+        f"🇨🇳 底注：<b>{money(minimum_bet)}</b>　下注时间：<b>{betting_seconds} 秒</b>\n\n"
+        "<b>文字下注格式：</b>\n"
+        "大小单双：<code>大100　小100　单100　双100</code>\n"
+        "组合：<code>dd100　ds100　xd100　xs100</code>\n"
+        "和值：<code>和值 10 100</code>\n"
+        "特殊：<code>顺子100　豹子100　111 100</code>\n\n"
         "一条消息可发送多项投注，任一项目有误则整条不扣分。"
     )
 
@@ -131,10 +133,41 @@ def closed_caption(
     *, round_number: int, player_count: int, bet_count: int, turnover: Decimal
 ) -> str:
     return (
-        f"<b>第 {round_number} 期 · 停止下注</b>\n"
+        "<b>🚫 停止下注，等待掷骰子</b>\n"
+        f"期号：<code>{str(round_number).zfill(6)}</code>\n"
         f"参与玩家：{player_count} 人　投注项目：{bet_count} 项\n"
         f"本期总流水：<b>{money(turnover)}</b>"
     )
+
+
+def closed_bet_text(
+    *,
+    round_number: int,
+    rows: Sequence[BetSummary],
+    bet_count: int,
+    turnover: Decimal,
+    rolling_seconds: int,
+) -> str:
+    lines = [
+        "<b>🚫 停止下注，等待掷骰子</b>",
+        f"期号：<code>{str(round_number).zfill(6)}</code>",
+        f"本期下注玩家：{len(rows)} 人　投注项目：{bet_count} 项",
+        f"本期总流水：<b>{money(turnover)}</b>",
+    ]
+    if not rows:
+        lines.extend(("", f"无人下注，机器人将在 {rolling_seconds} 秒后掷骰子。"))
+        return "\n".join(lines)
+    for index, row in enumerate(rows, 1):
+        lines.extend(
+            (
+                "",
+                f"{index}. {escape(row.display_name)}（ID: <code>{row.user_id}</code>）",
+                f"投注：{escape('、'.join(row.items))}",
+                f"小计：<b>{money(row.total)}</b>",
+            )
+        )
+    lines.extend(("", f"机器人将在 {rolling_seconds} 秒后掷骰子。"))
+    return "\n".join(lines)
 
 
 def result_caption(round_number: int, outcome: DiceOutcome, source: str) -> str:
@@ -270,27 +303,11 @@ def _png(image: Image.Image) -> bytes:
 
 
 @lru_cache(maxsize=2)
-def render_status_banner(mode: str) -> bytes:
+def load_status_animation(mode: str) -> bytes:
     if mode not in {"open", "closed"}:
         raise ValueError("unknown status banner mode")
-    image = Image.new("RGB", (1200, 500), CANVAS)
-    draw = ImageDraw.Draw(image)
-    accent = RED if mode == "open" else CYAN
-    title = "开始下注" if mode == "open" else "停止下注"
-    subtitle = "BETTING IS OPEN" if mode == "open" else "BETTING IS CLOSED"
-    detail = "请按格式提交本期投注" if mode == "open" else "本期投注已经锁定"
-    draw.rectangle((0, 0, 22, 500), fill=accent)
-    draw.text((70, 62), "BOTWANFA  ·  三骰", font=_font(31, True), fill=GOLD)
-    draw.text((70, 145), title, font=_font(88, True), fill=WHITE)
-    draw.text((75, 264), subtitle, font=_font(28, True), fill=accent)
-    draw.text((75, 335), detail, font=_font(32), fill=MUTED)
-    draw.rounded_rectangle((780, 65, 1135, 420), radius=12, fill=PANEL)
-    dice_values = (2, 5, 6) if mode == "open" else (1, 3, 4)
-    for index, value in enumerate(dice_values):
-        _draw_die(draw, 820 + index * 100, 150, 78, value)
-    draw.line((820, 275, 1098, 275), fill=accent, width=4)
-    draw.text((959, 310), "3 DICE", font=_font(30, True), fill=WHITE, anchor="ma")
-    return _png(image)
+    filename = "betting-open.gif" if mode == "open" else "betting-closed.gif"
+    return (Path(__file__).with_name("assets") / filename).read_bytes()
 
 
 def _wrap(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:

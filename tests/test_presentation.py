@@ -8,10 +8,11 @@ from botwanfa.presentation import (
     BetSummary,
     SettlementSummary,
     TrendPoint,
+    closed_bet_text,
+    load_status_animation,
     open_caption,
     render_bet_summary_pages,
     render_settlement_pages,
-    render_status_banner,
     render_trend_image,
     result_caption,
     rules_text,
@@ -29,7 +30,7 @@ def image_size(content: bytes) -> tuple[int, int]:
 
 def test_open_and_success_templates_include_required_details() -> None:
     opened = open_caption(round_number=12, betting_seconds=30, minimum_bet=Decimal(1))
-    assert "第 12 期" in opened
+    assert "期号：<code>000012</code>" in opened
     assert "30 秒" in opened
     assert "和值 10 100" in opened
     assert "任一项目有误则整条不扣分" in opened
@@ -52,6 +53,28 @@ def test_result_caption_keeps_triple_independent_results() -> None:
     assert "小 / 单 / 小单" in caption
     assert "豹子" in caption
     assert "指定豹子111" in caption
+
+
+def test_normal_close_message_keeps_player_bets_in_text() -> None:
+    rows = [
+        BetSummary(
+            user_id=123,
+            display_name="玩家甲",
+            items=("大 100.00", "和值10 50.00"),
+            total=Decimal(150),
+        )
+    ]
+    text = closed_bet_text(
+        round_number=12,
+        rows=rows,
+        bet_count=2,
+        turnover=Decimal(150),
+        rolling_seconds=10,
+    )
+    assert "本期下注玩家：1 人" in text
+    assert "玩家甲" in text
+    assert "投注：大 100.00、和值10 50.00" in text
+    assert "机器人将在 10 秒后掷骰子" in text
 
 
 def test_rules_template_uses_current_group_odds() -> None:
@@ -77,8 +100,8 @@ def test_rules_template_uses_current_group_odds() -> None:
 
 
 def test_status_and_trend_images_are_valid_png_files() -> None:
-    assert image_size(render_status_banner("open")) == (1200, 500)
-    assert image_size(render_status_banner("closed")) == (1200, 500)
+    assert image_size(load_status_animation("open")) == (240, 120)
+    assert image_size(load_status_animation("closed")) == (240, 120)
     points = []
     for number in range(1, 85):
         dice = (number % 6 + 1, (number + 1) % 6 + 1, (number + 2) % 6 + 1)
