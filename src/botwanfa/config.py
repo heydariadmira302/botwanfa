@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     timezone: str = "Asia/Shanghai"
     scheduler_poll_seconds: float = Field(default=1.0, gt=0)
     sender_poll_seconds: float = Field(default=0.25, gt=0)
+    backup_passphrase: SecretStr = SecretStr("")
 
     @field_validator("super_admin_ids", mode="before")
     @classmethod

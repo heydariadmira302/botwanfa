@@ -15,7 +15,7 @@ else
 fi
 
 log "正在拉取最新代码..."
-git pull --ff-only || true
+git pull --ff-only
 
 log "正在重新构建镜像..."
 "${DOCKER[@]}" compose build --pull

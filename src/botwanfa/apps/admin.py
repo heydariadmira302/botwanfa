@@ -1,0 +1,1357 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import os
+import uuid
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from html import escape
+from pathlib import Path
+
+from aiogram import Bot, F, Router
+from aiogram.enums import ChatType, ParseMode
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy import func, select
+from sqlalchemy.engine import make_url
+
+from botwanfa.backup_crypto import encrypt_file
+from botwanfa.config import get_settings
+from botwanfa.db.models import (
+    AdminAction,
+    BackupRecord,
+    BetBatch,
+    GameSettings,
+    GroupMember,
+    OddsSetting,
+    OutboxMessage,
+    Round,
+    RoundPlayerSettlement,
+    TelegramGroup,
+    User,
+    Wallet,
+    WalletLedger,
+    WinningStreak,
+)
+
+router = Router(name="super_admin")
+PAGE_SIZE = 8
+ACTIVE_ROUND_STATUSES = (
+    "waiting",
+    "betting",
+    "closed",
+    "waiting_for_player_dice",
+    "bot_rolling",
+    "settling",
+    "paused",
+    "failed",
+    "manual_review",
+)
+STATUS_LABELS = {
+    "waiting": "等待开局",
+    "betting": "下注中",
+    "closed": "已封盘",
+    "waiting_for_player_dice": "等待玩家掷骰",
+    "bot_rolling": "机器人开奖",
+    "settling": "结算中",
+    "completed": "已完成",
+    "paused": "已暂停",
+    "failed": "运行异常",
+    "manual_review": "等待人工处理",
+}
+ODDS_LABELS = {
+    "big": "大",
+    "small": "小",
+    "odd": "单",
+    "even": "双",
+    "big_odd": "大单 dd",
+    "big_even": "大双 ds",
+    "small_odd": "小单 xd",
+    "small_even": "小双 xs",
+    "sum": "和值",
+    "straight": "顺子",
+    "any_triple": "任意豹子",
+    "specific_triple": "指定豹子",
+}
+ACTION_LABELS = {
+    "group_paused": "暂停群运行",
+    "group_resumed": "恢复群运行",
+    "setting_changed": "修改群参数",
+    "odds_changed": "修改玩法倍率",
+    "wallet_credit": "玩家上分",
+    "wallet_debit": "玩家下分",
+    "test_mode_enabled": "开启测试模式",
+    "test_mode_disabled": "关闭测试模式",
+    "rules_published": "发送玩法说明",
+    "backup_created": "立即备份",
+}
+
+
+class AdminInput(StatesGroup):
+    setting_value = State()
+    player_search = State()
+    wallet_adjustment = State()
+    wallet_confirmation = State()
+
+
+def is_super_admin(user_id: int | None) -> bool:
+    return bool(user_id and user_id in get_settings().super_admin_ids)
+
+
+def _button(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def admin_menu_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_button("📊 运行总览", "a:o"), _button("🎮 群管理", "a:gl:0:manage")],
+            [_button("🔎 查询玩家", "a:us:0"), _button("💳 玩家上下分", "a:us:0")],
+            [_button("🏆 群排行榜", "a:gl:0:ranking"), _button("📈 数据报表", "a:gl:0:report")],
+            [_button("🧾 操作日志", "a:l:0"), _button("💾 备份恢复", "a:bk")],
+            [_button("🧪 测试模式", "a:gl:0:test"), _button("📖 玩法说明", "a:rules")],
+        ]
+    )
+
+
+def _home_button() -> list[InlineKeyboardButton]:
+    return [_button("🏠 管理首页", "a:h")]
+
+
+async def _audit(session, admin_id: int, action: str, group_id: int | None, **details) -> None:
+    session.add(
+        AdminAction(
+            admin_user_id=admin_id,
+            group_id=group_id,
+            action=action,
+            details=details,
+        )
+    )
+
+
+async def _home_view(session_factory) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        groups = int(await session.scalar(select(func.count(TelegramGroup.id))) or 0)
+        running = int(
+            await session.scalar(
+                select(func.count(TelegramGroup.id)).where(
+                    TelegramGroup.enabled.is_(True), TelegramGroup.paused.is_(False)
+                )
+            )
+            or 0
+        )
+        paused = int(
+            await session.scalar(
+                select(func.count(TelegramGroup.id)).where(TelegramGroup.paused.is_(True))
+            )
+            or 0
+        )
+        active = int(
+            await session.scalar(
+                select(func.count(Round.id)).where(Round.status.in_(ACTIVE_ROUND_STATUSES))
+            )
+            or 0
+        )
+        failed_messages = int(
+            await session.scalar(
+                select(func.count(OutboxMessage.id)).where(OutboxMessage.status == "failed")
+            )
+            or 0
+        )
+    health = "🟢 正常" if failed_messages == 0 else f"🟠 有 {failed_messages} 条发送失败"
+    text = (
+        "<b>BOTWANFA 管理中心</b>\n\n"
+        f"系统状态：{health}\n"
+        f"群组：{groups} 个  ·  运行：{running} 个  ·  暂停：{paused} 个\n"
+        f"当前未完成期次：{active} 个\n\n"
+        "请选择要执行的管理操作。"
+    )
+    return text, admin_menu_markup()
+
+
+async def _overview_view(session_factory) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        player_count = int(await session.scalar(select(func.count(User.id))) or 0)
+        wallet_total = await session.scalar(select(func.coalesce(func.sum(Wallet.balance), 0)))
+        completed = int(
+            await session.scalar(
+                select(func.count(Round.id)).where(Round.status == "completed")
+            )
+            or 0
+        )
+        pending = int(
+            await session.scalar(
+                select(func.count(OutboxMessage.id)).where(
+                    OutboxMessage.status.in_(("pending", "processing"))
+                )
+            )
+            or 0
+        )
+        failed = int(
+            await session.scalar(
+                select(func.count(OutboxMessage.id)).where(OutboxMessage.status == "failed")
+            )
+            or 0
+        )
+        latest = await session.scalar(select(func.max(Round.created_at)))
+    latest_text = latest.astimezone(get_settings().tz).strftime("%Y-%m-%d %H:%M:%S") if latest else "暂无"
+    text = (
+        "<b>📊 运行总览</b>\n\n"
+        f"已记录玩家：{player_count}\n"
+        f"全部钱包余额：{wallet_total or Decimal('0.00')}\n"
+        f"已完成期次：{completed}\n"
+        f"待发送消息：{pending}\n"
+        f"发送失败消息：{failed}\n"
+        f"最近开局时间：{latest_text}\n\n"
+        "服务：bot / scheduler / worker / sender / PostgreSQL / Redis"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[_button("🔄 刷新", "a:o")], _home_button()]
+    )
+    return text, markup
+
+
+def _group_target(mode: str, group_id: int) -> str:
+    return {
+        "players": f"a:pl:{group_id}:0",
+        "ranking": f"a:r:{group_id}:day",
+        "report": f"a:rp:{group_id}",
+        "test": f"a:x:{group_id}",
+    }.get(mode, f"a:g:{group_id}")
+
+
+async def _groups_view(
+    session_factory, page: int, mode: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        total = int(await session.scalar(select(func.count(TelegramGroup.id))) or 0)
+        groups = (
+            await session.scalars(
+                select(TelegramGroup)
+                .order_by(TelegramGroup.created_at.desc())
+                .offset(page * PAGE_SIZE)
+                .limit(PAGE_SIZE)
+            )
+        ).all()
+    title = {
+        "players": "选择玩家所在群",
+        "ranking": "选择要查看排行的群",
+        "report": "选择要查看报表的群",
+        "test": "选择要设置测试模式的群",
+    }.get(mode, "选择要管理的群")
+    rows: list[list[InlineKeyboardButton]] = []
+    for group in groups:
+        icon = "⏸" if group.paused else ("🟢" if group.enabled else "⚫")
+        label = (group.title or f"群 {group.id}").strip()
+        if len(label) > 28:
+            label = label[:27] + "…"
+        rows.append([_button(f"{icon} {label}", _group_target(mode, group.id))])
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(_button("⬅️ 上一页", f"a:gl:{page - 1}:{mode}"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(_button("下一页 ➡️", f"a:gl:{page + 1}:{mode}"))
+    if nav:
+        rows.append(nav)
+    rows.append([_button("🔄 刷新", f"a:gl:{page}:{mode}"), _button("🏠 首页", "a:h")])
+    if not groups:
+        text = f"<b>🎮 {title}</b>\n\n尚未记录群。把机器人加入群后，在群里发送 /start。"
+    else:
+        text = f"<b>🎮 {title}</b>\n\n共 {total} 个群，第 {page + 1} 页。"
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _group_view(session_factory, group_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        settings = await session.get(GameSettings, group_id)
+        active = await session.scalar(
+            select(Round)
+            .where(Round.group_id == group_id, Round.status.in_(ACTIVE_ROUND_STATUSES))
+            .order_by(Round.id.desc())
+            .limit(1)
+        )
+        members = int(
+            await session.scalar(
+                select(func.count(GroupMember.id)).where(GroupMember.group_id == group_id)
+            )
+            or 0
+        )
+        wallet_total = await session.scalar(
+            select(func.coalesce(func.sum(Wallet.balance), 0)).where(Wallet.group_id == group_id)
+        )
+    if group is None or settings is None:
+        return "群资料不存在。", InlineKeyboardMarkup(inline_keyboard=[_home_button()])
+    state = "⏸ 已暂停" if group.paused else "🟢 自动运行"
+    round_text = (
+        f"第 {active.round_number} 期 · {STATUS_LABELS.get(active.status, active.status)}"
+        if active
+        else "等待下一期"
+    )
+    threshold = settings.player_dice_threshold
+    threshold_text = "关闭" if threshold is None else str(threshold)
+    test_text = "开启" if settings.test_mode else "关闭"
+    text = (
+        f"<b>🎮 {escape(group.title or f'群 {group.id}')}</b>\n"
+        f"<code>{group.id}</code>\n\n"
+        f"运行状态：{state}\n"
+        f"当前期次：{round_text}\n"
+        f"玩家数量：{members}  ·  钱包合计：{wallet_total or Decimal('0.00')}\n\n"
+        f"下注/封盘开奖/下一局：{settings.betting_seconds}s / "
+        f"{settings.rolling_seconds}s / {settings.next_round_seconds}s\n"
+        f"最低下注：{settings.minimum_bet}  ·  玩家掷骰门槛：{threshold_text}\n"
+        f"走势期数：{settings.history_size}  ·  测试模式：{test_text}"
+    )
+    toggle = "▶️ 恢复运行" if group.paused else "⏸ 暂停运行"
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_button(toggle, f"a:p:{group_id}"), _button("🔄 刷新", f"a:g:{group_id}")],
+            [_button("⏱ 时间设置", f"a:t:{group_id}"), _button("💰 底注与掷骰", f"a:b:{group_id}")],
+            [_button("🎯 倍率设置", f"a:ol:{group_id}:0"), _button("🎁 签到与连胜", f"a:w:{group_id}")],
+            [_button("👤 玩家管理", f"a:pl:{group_id}:0"), _button("🏆 排行榜", f"a:r:{group_id}:day")],
+            [_button("📈 走势与报表", f"a:d:{group_id}"), _button("🧪 测试模式", f"a:x:{group_id}")],
+            [_button("📣 发送玩法说明", f"a:pub:{group_id}")],
+            [_button("⬅️ 群列表", "a:gl:0:manage"), _button("🏠 首页", "a:h")],
+        ]
+    )
+    return text, markup
+
+
+async def _time_view(session_factory, group_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        settings = await session.get(GameSettings, group_id)
+    if group is None or settings is None:
+        return await _group_view(session_factory, group_id)
+    rows = []
+    fields = (
+        ("下注窗口", "bs", settings.betting_seconds),
+        ("封盘到开奖", "rs", settings.rolling_seconds),
+        ("结算到下一局", "ns", settings.next_round_seconds),
+        ("玩家掷骰窗口", "ps", settings.player_dice_seconds),
+    )
+    for label, code, value in fields:
+        rows.append(
+            [
+                _button("−5", f"a:ta:{group_id}:{code}:-5"),
+                _button(f"{label} {value}s", f"a:i:{group_id}:{code}"),
+                _button("+5", f"a:ta:{group_id}:{code}:5"),
+            ]
+        )
+    rows.append([_button("⬅️ 返回群控制台", f"a:g:{group_id}")])
+    text = (
+        f"<b>⏱ {escape(group.title)} · 时间设置</b>\n\n"
+        "点击中间数值可直接输入，修改从下一期生效。"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _basic_view(session_factory, group_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        settings = await session.get(GameSettings, group_id)
+    if group is None or settings is None:
+        return await _group_view(session_factory, group_id)
+    threshold = "关闭" if settings.player_dice_threshold is None else settings.player_dice_threshold
+    text = (
+        f"<b>💰 {escape(group.title)} · 底注与玩家掷骰</b>\n\n"
+        f"最低下注：<b>{settings.minimum_bet}</b>\n"
+        f"玩家掷骰门槛：<b>{threshold}</b>\n\n"
+        "门槛按本期累计有效投注额判断。多人达标时，投注最高者优先。"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_button("✏️ 修改最低下注", f"a:i:{group_id}:min")],
+            [_button("✏️ 修改掷骰门槛", f"a:i:{group_id}:dice")],
+            [_button("🚫 关闭玩家掷骰", f"a:pd:{group_id}:off")],
+            [_button("⬅️ 返回群控制台", f"a:g:{group_id}")],
+        ]
+    )
+    return text, markup
+
+
+def _odds_name(row: OddsSetting) -> str:
+    base = ODDS_LABELS.get(row.bet_type, row.bet_type)
+    if row.bet_value:
+        base = f"{base} {row.bet_value}"
+    return base
+
+
+async def _odds_view(
+    session_factory, group_id: int, page: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        total = int(
+            await session.scalar(
+                select(func.count(OddsSetting.id)).where(OddsSetting.group_id == group_id)
+            )
+            or 0
+        )
+        odds = (
+            await session.scalars(
+                select(OddsSetting)
+                .where(OddsSetting.group_id == group_id)
+                .order_by(OddsSetting.bet_type, OddsSetting.bet_value)
+                .offset(page * PAGE_SIZE)
+                .limit(PAGE_SIZE)
+            )
+        ).all()
+    rows = [
+        [
+            _button(
+                f"{'✅' if item.enabled else '🚫'} {_odds_name(item)}  ×{item.payout_multiplier}",
+                f"a:oi:{group_id}:{item.id}",
+            )
+        ]
+        for item in odds
+    ]
+    nav = []
+    if page > 0:
+        nav.append(_button("⬅️ 上一页", f"a:ol:{group_id}:{page - 1}"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(_button("下一页 ➡️", f"a:ol:{group_id}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([_button("⬅️ 返回群控制台", f"a:g:{group_id}")])
+    text = (
+        f"<b>🎯 {escape(group.title if group else str(group_id))} · 倍率设置</b>\n\n"
+        f"共 {total} 个赔率项。点击项目后输入返还倍数，返还额包含本金。"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _welfare_view(session_factory, group_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        settings = await session.get(GameSettings, group_id)
+    if group is None or settings is None:
+        return await _group_view(session_factory, group_id)
+    rewards = "、".join(f"{count}连胜={reward}" for count, reward in settings.streak_rewards.items())
+    text = (
+        f"<b>🎁 {escape(group.title)} · 签到与连胜</b>\n\n"
+        f"签到范围：{settings.checkin_min} 至 {settings.checkin_max}\n"
+        f"签到步进：{settings.checkin_step}\n"
+        f"连胜奖励：{'开启' if settings.streak_enabled else '关闭'}\n"
+        f"奖励档位：{escape(rewards or '未设置')}"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_button("签到最小值", f"a:i:{group_id}:cmin"), _button("签到最大值", f"a:i:{group_id}:cmax")],
+            [_button("签到步进", f"a:i:{group_id}:cstep"), _button("连胜档位", f"a:i:{group_id}:streak")],
+            [_button("关闭连胜" if settings.streak_enabled else "开启连胜", f"a:st:{group_id}")],
+            [_button("⬅️ 返回群控制台", f"a:g:{group_id}")],
+        ]
+    )
+    return text, markup
+
+
+async def _data_view(session_factory, group_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        settings = await session.get(GameSettings, group_id)
+    if group is None or settings is None:
+        return await _group_view(session_factory, group_id)
+    text = (
+        f"<b>📈 {escape(group.title)} · 走势与数据</b>\n\n"
+        f"走势图显示最近 <b>{settings.history_size}</b> 期。\n"
+        "报表按当前群独立统计。"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_button("28期", f"a:hs:{group_id}:28"), _button("84期", f"a:hs:{group_id}:84"), _button("168期", f"a:hs:{group_id}:168")],
+            [_button("✏️ 自定义走势期数", f"a:i:{group_id}:history")],
+            [_button("📊 查看群报表", f"a:rp:{group_id}"), _button("🏆 查看排行榜", f"a:r:{group_id}:day")],
+            [_button("⬅️ 返回群控制台", f"a:g:{group_id}")],
+        ]
+    )
+    return text, markup
+
+
+async def _test_view(session_factory, group_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        settings = await session.get(GameSettings, group_id)
+    if group is None or settings is None:
+        return await _group_view(session_factory, group_id)
+    state = "🟠 已开启" if settings.test_mode else "⚪ 已关闭"
+    text = (
+        f"<b>🧪 {escape(group.title)} · 测试模式</b>\n\n"
+        f"当前状态：{state}\n\n"
+        "开启后，新一期会使用更短的测试等待时间；该设置仅影响当前群。"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_button("关闭测试模式" if settings.test_mode else "开启测试模式", f"a:xt:{group_id}")],
+            [_button("⬅️ 返回群控制台", f"a:g:{group_id}")],
+        ]
+    )
+    return text, markup
+
+
+async def _players_view(
+    session_factory, group_id: int, page: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        total = int(
+            await session.scalar(select(func.count(Wallet.id)).where(Wallet.group_id == group_id))
+            or 0
+        )
+        players = (
+            await session.execute(
+                select(User, Wallet)
+                .join(Wallet, Wallet.user_id == User.id)
+                .where(Wallet.group_id == group_id)
+                .order_by(Wallet.updated_at.desc())
+                .offset(page * PAGE_SIZE)
+                .limit(PAGE_SIZE)
+            )
+        ).all()
+    rows = [
+        [_button(f"{user.display_name[:18]} · {wallet.balance}", f"a:u:{group_id}:{user.id}:all")]
+        for user, wallet in players
+    ]
+    rows.insert(0, [_button("🔎 搜索玩家", f"a:us:{group_id}")])
+    nav = []
+    if page > 0:
+        nav.append(_button("⬅️ 上一页", f"a:pl:{group_id}:{page - 1}"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(_button("下一页 ➡️", f"a:pl:{group_id}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([_button("⬅️ 返回群控制台", f"a:g:{group_id}")])
+    text = (
+        f"<b>👤 {escape(group.title if group else str(group_id))} · 玩家管理</b>\n\n"
+        f"共 {total} 个钱包。可按用户名、@用户名、用户ID或转发消息搜索。"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _player_groups_view(
+    session_factory, user_id: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        wallets = (
+            await session.execute(
+                select(TelegramGroup, Wallet)
+                .join(Wallet, Wallet.group_id == TelegramGroup.id)
+                .where(Wallet.user_id == user_id)
+                .order_by(TelegramGroup.created_at.desc())
+            )
+        ).all()
+    if user is None or not wallets:
+        return "玩家钱包不存在。", InlineKeyboardMarkup(inline_keyboard=[_home_button()])
+    if len(wallets) == 1:
+        return await _player_view(session_factory, wallets[0][0].id, user_id, "all")
+    rows = [
+        [
+            _button(
+                f"{(group.title or str(group.id))[:24]} · 余额 {wallet.balance}",
+                f"a:u:{group.id}:{user_id}:all",
+            )
+        ]
+        for group, wallet in wallets
+    ]
+    rows.append(_home_button())
+    text = (
+        f"<b>🔎 {escape(user.display_name)}</b>\n\n"
+        "该玩家在多个群有独立钱包，请选择目标群。"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _period_start(period: str) -> datetime | None:
+    tz = get_settings().tz
+    now = datetime.now(tz)
+    if period == "day":
+        local = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        local = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    elif period == "month":
+        local = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        return None
+    return local.astimezone(UTC)
+
+
+async def _player_view(
+    session_factory, group_id: int, user_id: int, period: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        user = await session.get(User, user_id)
+        wallet = await session.scalar(
+            select(Wallet).where(Wallet.group_id == group_id, Wallet.user_id == user_id)
+        )
+        streak = await session.scalar(
+            select(WinningStreak).where(
+                WinningStreak.group_id == group_id, WinningStreak.user_id == user_id
+            )
+        )
+        query = select(RoundPlayerSettlement).where(
+            RoundPlayerSettlement.group_id == group_id,
+            RoundPlayerSettlement.user_id == user_id,
+        )
+        if period in {"r10", "r30", "r50"}:
+            count = int(period[1:])
+            settlements = (
+                await session.scalars(
+                    query.order_by(RoundPlayerSettlement.settled_at.desc()).limit(count)
+                )
+            ).all()
+        else:
+            start = _period_start(period)
+            if start is not None:
+                query = query.where(RoundPlayerSettlement.settled_at >= start)
+            settlements = (await session.scalars(query)).all()
+    if group is None or user is None or wallet is None:
+        return "玩家资料不存在。", InlineKeyboardMarkup(inline_keyboard=[_home_button()])
+    wagered = sum((item.wagered for item in settlements), Decimal("0.00"))
+    returned = sum((item.returned for item in settlements), Decimal("0.00"))
+    net = sum((item.net for item in settlements), Decimal("0.00"))
+    wins = sum(item.net > 0 for item in settlements)
+    losses = sum(item.net < 0 for item in settlements)
+    draws = len(settlements) - wins - losses
+    latest = max((item.settled_at for item in settlements), default=None)
+    latest_text = latest.astimezone(get_settings().tz).strftime("%Y-%m-%d %H:%M") if latest else "暂无"
+    period_name = {
+        "day": "今日",
+        "week": "本周",
+        "month": "本月",
+        "all": "全部",
+        "r10": "最近10局",
+        "r30": "最近30局",
+        "r50": "最近50局",
+    }.get(period, "全部")
+    username = f"@{user.username}" if user.username else "未设置用户名"
+    text = (
+        f"<b>👤 {escape(user.display_name)}</b>\n"
+        f"{escape(username)} · <code>{user.id}</code>\n"
+        f"群：{escape(group.title)}\n\n"
+        f"统计周期：<b>{period_name}</b>\n"
+        f"当前余额：<b>{wallet.balance}</b>\n"
+        f"投注流水：{wagered}\n"
+        f"中奖返还：{returned}\n"
+        f"净输赢：{net}\n"
+        f"参与局数：{len(settlements)}  ·  盈 {wins} / 亏 {losses} / 平 {draws}\n"
+        f"当前连胜：{streak.current_count if streak else 0}  ·  最高连胜：{streak.highest_count if streak else 0}\n"
+        f"最近参与：{latest_text}"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_button("今日", f"a:u:{group_id}:{user_id}:day"), _button("本周", f"a:u:{group_id}:{user_id}:week"), _button("本月", f"a:u:{group_id}:{user_id}:month")],
+            [_button("全部", f"a:u:{group_id}:{user_id}:all"), _button("近10局", f"a:u:{group_id}:{user_id}:r10"), _button("近30局", f"a:u:{group_id}:{user_id}:r30"), _button("近50局", f"a:u:{group_id}:{user_id}:r50")],
+            [_button("➕ 上分", f"a:ua:{group_id}:{user_id}:credit"), _button("➖ 下分", f"a:ua:{group_id}:{user_id}:debit")],
+            [_button("⬅️ 玩家列表", f"a:pl:{group_id}:0"), _button("🏠 首页", "a:h")],
+        ]
+    )
+    return text, markup
+
+
+async def _ranking_view(
+    session_factory, group_id: int, period: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    start = _period_start(period)
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        query = (
+            select(User.id, User.display_name, func.sum(BetBatch.total_amount).label("turnover"))
+            .join(User, User.id == BetBatch.user_id)
+            .where(BetBatch.group_id == group_id)
+            .group_by(User.id, User.display_name)
+            .order_by(func.sum(BetBatch.total_amount).desc())
+            .limit(5)
+        )
+        if start is not None:
+            query = query.where(BetBatch.created_at >= start)
+        rows = (await session.execute(query)).all()
+    name = {"day": "日榜", "week": "周榜", "month": "月榜"}.get(period, "排行榜")
+    lines = [
+        f"{index}. {escape(display_name)}（<code>{user_id}</code>） · {turnover}"
+        for index, (user_id, display_name, turnover) in enumerate(rows, 1)
+    ]
+    text = (
+        f"<b>🏆 {escape(group.title if group else str(group_id))} · {name}</b>\n\n"
+        + ("\n".join(lines) if lines else "当前周期暂无有效投注。")
+        + "\n\n按有效投注流水排序，显示前5名。"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_button("日榜", f"a:r:{group_id}:day"), _button("周榜", f"a:r:{group_id}:week"), _button("月榜", f"a:r:{group_id}:month")],
+            [_button("⬅️ 返回群控制台", f"a:g:{group_id}")],
+        ]
+    )
+    return text, markup
+
+
+async def _report_view(session_factory, group_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        rounds = int(
+            await session.scalar(select(func.count(Round.id)).where(Round.group_id == group_id))
+            or 0
+        )
+        completed = int(
+            await session.scalar(
+                select(func.count(Round.id)).where(
+                    Round.group_id == group_id, Round.status == "completed"
+                )
+            )
+            or 0
+        )
+        wagered = await session.scalar(
+            select(func.coalesce(func.sum(BetBatch.total_amount), 0)).where(
+                BetBatch.group_id == group_id
+            )
+        )
+        returned = await session.scalar(
+            select(func.coalesce(func.sum(RoundPlayerSettlement.returned), 0)).where(
+                RoundPlayerSettlement.group_id == group_id
+            )
+        )
+        players = int(
+            await session.scalar(select(func.count(Wallet.id)).where(Wallet.group_id == group_id))
+            or 0
+        )
+        balance = await session.scalar(
+            select(func.coalesce(func.sum(Wallet.balance), 0)).where(Wallet.group_id == group_id)
+        )
+    wagered = Decimal(wagered or 0)
+    returned = Decimal(returned or 0)
+    text = (
+        f"<b>📈 {escape(group.title if group else str(group_id))} · 数据报表</b>\n\n"
+        f"全部期次：{rounds}\n"
+        f"已完成期次：{completed}\n"
+        f"玩家钱包：{players}\n"
+        f"累计投注流水：{wagered}\n"
+        f"累计中奖返还：{returned}\n"
+        f"玩家累计净输赢：{returned - wagered}\n"
+        f"当前钱包总余额：{balance or Decimal('0.00')}"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[_button("🔄 刷新", f"a:rp:{group_id}")], [_button("⬅️ 返回群控制台", f"a:g:{group_id}")]]
+    )
+    return text, markup
+
+
+async def _logs_view(session_factory, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        total = int(await session.scalar(select(func.count(AdminAction.id))) or 0)
+        actions = (
+            await session.scalars(
+                select(AdminAction)
+                .order_by(AdminAction.created_at.desc())
+                .offset(page * 10)
+                .limit(10)
+            )
+        ).all()
+    lines = []
+    for item in actions:
+        at = item.created_at.astimezone(get_settings().tz).strftime("%m-%d %H:%M")
+        group = f"群 {item.group_id}" if item.group_id else "系统"
+        lines.append(
+            f"{at} · {escape(ACTION_LABELS.get(item.action, item.action))} · {group} · 管理员 {item.admin_user_id}"
+        )
+    rows: list[list[InlineKeyboardButton]] = []
+    nav = []
+    if page > 0:
+        nav.append(_button("⬅️ 上一页", f"a:l:{page - 1}"))
+    if (page + 1) * 10 < total:
+        nav.append(_button("下一页 ➡️", f"a:l:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append(_home_button())
+    text = "<b>🧾 管理员操作日志</b>\n\n" + ("\n".join(lines) if lines else "暂无操作记录。")
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _backup_files() -> list[Path]:
+    backup_dir = Path("backups")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    return sorted(backup_dir.glob("*.bwf"), key=lambda item: item.stat().st_mtime, reverse=True)
+
+
+def _file_checksum(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def _backup_view() -> tuple[str, InlineKeyboardMarkup]:
+    files = _backup_files()
+    latest = files[0].name if files else "暂无"
+    text = (
+        "<b>💾 备份与恢复</b>\n\n"
+        f"加密备份数量：{len(files)}\n"
+        f"最近备份：{escape(latest)}\n\n"
+        "立即备份会生成 PostgreSQL 一致性快照，并使用部署时设置的密钥加密。"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_button("📦 立即备份", "a:bn"), _button("📂 备份列表", "a:bl")],
+            [_button("♻️ 恢复备份", "a:br")],
+            _home_button(),
+        ]
+    )
+    return text, markup
+
+
+async def _backup_list_view() -> tuple[str, InlineKeyboardMarkup]:
+    files = _backup_files()[:20]
+    lines = []
+    for index, item in enumerate(files, 1):
+        size = item.stat().st_size / 1024 / 1024
+        modified = datetime.fromtimestamp(item.stat().st_mtime, get_settings().tz).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        lines.append(f"{index}. <code>{escape(item.name)}</code> · {size:.2f} MB · {modified}")
+    text = "<b>📂 加密备份列表</b>\n\n" + ("\n".join(lines) if lines else "暂无备份文件。")
+    markup = InlineKeyboardMarkup(inline_keyboard=[[_button("⬅️ 返回备份", "a:bk")]])
+    return text, markup
+
+
+async def _create_backup(session_factory, admin_id: int) -> str:
+    settings = get_settings()
+    passphrase = settings.backup_passphrase.get_secret_value()
+    if len(passphrase) < 12:
+        raise ValueError("备份加密密钥未正确配置")
+    url = make_url(settings.database_url)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    backup_dir = Path("backups")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    raw = backup_dir / f".admin-{stamp}-{uuid.uuid4().hex}.dump"
+    target = backup_dir / f"botwanfa-{stamp}.bwf"
+    env = os.environ.copy()
+    if url.password:
+        env["PGPASSWORD"] = url.password
+    process = await asyncio.create_subprocess_exec(
+        "pg_dump",
+        "--host",
+        url.host or "localhost",
+        "--port",
+        str(url.port or 5432),
+        "--username",
+        url.username or "botwanfa",
+        "--dbname",
+        url.database or "botwanfa",
+        "--format=custom",
+        "--file",
+        str(raw),
+        env=env,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raw.unlink(missing_ok=True)
+        raise RuntimeError(stderr.decode("utf-8", errors="replace")[-1000:])
+    try:
+        await asyncio.to_thread(encrypt_file, raw, target, passphrase)
+    finally:
+        raw.unlink(missing_ok=True)
+    checksum = await asyncio.to_thread(_file_checksum, target)
+    async with session_factory() as session, session.begin():
+        session.add(
+            BackupRecord(
+                filename=target.name,
+                backup_type="manual",
+                status="completed",
+                size_bytes=target.stat().st_size,
+                checksum=checksum,
+            )
+        )
+        await _audit(session, admin_id, "backup_created", None, filename=target.name)
+    return target.name
+
+
+async def _show(query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
+    if query.message:
+        try:
+            await query.message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                await query.message.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("start", "menu", "菜单"), F.chat.type == ChatType.PRIVATE)
+async def admin_start(message: Message, session_factory, state: FSMContext) -> None:
+    await state.clear()
+    if not is_super_admin(message.from_user.id if message.from_user else None):
+        await message.answer(
+            "当前账号不在超级管理员名单中。请检查服务器 .env 的 SUPER_ADMIN_IDS。"
+        )
+        return
+    text, markup = await _home_view(session_factory)
+    await message.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("a:"))
+async def admin_callback(
+    query: CallbackQuery, session_factory, state: FSMContext, bot: Bot
+) -> None:
+    admin_id = query.from_user.id if query.from_user else 0
+    if not is_super_admin(admin_id):
+        await query.answer("当前账号没有超级管理员权限", show_alert=True)
+        return
+    data = query.data or "a:h"
+    parts = data.split(":")
+    action = parts[1]
+    await query.answer()
+    if action not in {"uc", "ux"} and await state.get_state() is not None:
+        await state.clear()
+
+    if action == "h":
+        await _show(query, *(await _home_view(session_factory)))
+    elif action == "o":
+        await _show(query, *(await _overview_view(session_factory)))
+    elif action == "gl":
+        await _show(query, *(await _groups_view(session_factory, int(parts[2]), parts[3])))
+    elif action == "g":
+        await _show(query, *(await _group_view(session_factory, int(parts[2]))))
+    elif action == "p":
+        group_id = int(parts[2])
+        async with session_factory() as session, session.begin():
+            group = await session.get(TelegramGroup, group_id, with_for_update=True)
+            if group:
+                group.paused = not group.paused
+                audit_action = "group_paused" if group.paused else "group_resumed"
+                await _audit(session, admin_id, audit_action, group_id)
+        await _show(query, *(await _group_view(session_factory, group_id)))
+    elif action == "t":
+        await _show(query, *(await _time_view(session_factory, int(parts[2]))))
+    elif action == "ta":
+        group_id, code, delta = int(parts[2]), parts[3], int(parts[4])
+        fields = {"bs": "betting_seconds", "rs": "rolling_seconds", "ns": "next_round_seconds", "ps": "player_dice_seconds"}
+        async with session_factory() as session, session.begin():
+            settings = await session.get(GameSettings, group_id, with_for_update=True)
+            if settings:
+                field = fields[code]
+                value = max(1, min(3600, int(getattr(settings, field)) + delta))
+                setattr(settings, field, value)
+                settings.version += 1
+                await _audit(session, admin_id, "setting_changed", group_id, field=field, value=value)
+        await _show(query, *(await _time_view(session_factory, group_id)))
+    elif action == "b":
+        await _show(query, *(await _basic_view(session_factory, int(parts[2]))))
+    elif action == "pd":
+        group_id = int(parts[2])
+        async with session_factory() as session, session.begin():
+            settings = await session.get(GameSettings, group_id, with_for_update=True)
+            if settings:
+                settings.player_dice_threshold = None
+                settings.version += 1
+                await _audit(session, admin_id, "setting_changed", group_id, field="player_dice_threshold", value=None)
+        await _show(query, *(await _basic_view(session_factory, group_id)))
+    elif action == "ol":
+        await _show(query, *(await _odds_view(session_factory, int(parts[2]), int(parts[3]))))
+    elif action == "oi":
+        group_id, odds_id = int(parts[2]), int(parts[3])
+        async with session_factory() as session:
+            odds = await session.get(OddsSetting, odds_id)
+        if odds is None or odds.group_id != group_id:
+            await query.message.answer("赔率项目不存在。")
+            return
+        await state.set_state(AdminInput.setting_value)
+        await state.set_data({"kind": "odds", "group_id": group_id, "odds_id": odds_id, "return_to": f"a:ol:{group_id}:0"})
+        await query.message.answer(
+            f"请输入 <b>{escape(_odds_name(odds))}</b> 的返还倍数。\n当前值：{odds.payout_multiplier}\n示例：<code>2.00</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_button("取消", f"a:ol:{group_id}:0")]]),
+        )
+    elif action == "w":
+        await _show(query, *(await _welfare_view(session_factory, int(parts[2]))))
+    elif action == "st":
+        group_id = int(parts[2])
+        async with session_factory() as session, session.begin():
+            settings = await session.get(GameSettings, group_id, with_for_update=True)
+            if settings:
+                settings.streak_enabled = not settings.streak_enabled
+                settings.version += 1
+                await _audit(session, admin_id, "setting_changed", group_id, field="streak_enabled", value=settings.streak_enabled)
+        await _show(query, *(await _welfare_view(session_factory, group_id)))
+    elif action == "d":
+        await _show(query, *(await _data_view(session_factory, int(parts[2]))))
+    elif action == "hs":
+        group_id, value = int(parts[2]), int(parts[3])
+        async with session_factory() as session, session.begin():
+            settings = await session.get(GameSettings, group_id, with_for_update=True)
+            if settings:
+                settings.history_size = value
+                settings.version += 1
+                await _audit(session, admin_id, "setting_changed", group_id, field="history_size", value=value)
+        await _show(query, *(await _data_view(session_factory, group_id)))
+    elif action == "x":
+        await _show(query, *(await _test_view(session_factory, int(parts[2]))))
+    elif action == "xt":
+        group_id = int(parts[2])
+        async with session_factory() as session, session.begin():
+            settings = await session.get(GameSettings, group_id, with_for_update=True)
+            if settings:
+                settings.test_mode = not settings.test_mode
+                settings.version += 1
+                audit_action = "test_mode_enabled" if settings.test_mode else "test_mode_disabled"
+                await _audit(session, admin_id, audit_action, group_id)
+        await _show(query, *(await _test_view(session_factory, group_id)))
+    elif action == "pl":
+        await _show(query, *(await _players_view(session_factory, int(parts[2]), int(parts[3]))))
+    elif action == "us":
+        group_id = int(parts[2])
+        await state.set_state(AdminInput.player_search)
+        await state.set_data({"group_id": group_id})
+        await query.message.answer(
+            "请输入用户名、@用户名或 Telegram 数字ID，也可以直接转发该玩家的消息。",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [_button("取消", f"a:pl:{group_id}:0" if group_id else "a:h")]
+                ]
+            ),
+        )
+    elif action == "ug":
+        await _show(query, *(await _player_groups_view(session_factory, int(parts[2]))))
+    elif action == "u":
+        await _show(query, *(await _player_view(session_factory, int(parts[2]), int(parts[3]), parts[4])))
+    elif action == "ua":
+        group_id, user_id, direction = int(parts[2]), int(parts[3]), parts[4]
+        await state.set_state(AdminInput.wallet_adjustment)
+        await state.set_data({"group_id": group_id, "user_id": user_id, "direction": direction})
+        await query.message.answer(
+            f"请输入{'上分' if direction == 'credit' else '下分'}金额和备注。\n示例：<code>100 活动奖励</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_button("取消", f"a:u:{group_id}:{user_id}:all")]]),
+        )
+    elif action == "uc":
+        values = await state.get_data()
+        if await state.get_state() != AdminInput.wallet_confirmation.state:
+            await query.message.answer("本次确认已失效，请重新操作。")
+            return
+        group_id = int(values["group_id"])
+        user_id = int(values["user_id"])
+        amount = Decimal(values["amount"])
+        direction = values["direction"]
+        note = str(values["note"])
+        async with session_factory() as session, session.begin():
+            wallet = await session.scalar(
+                select(Wallet)
+                .where(Wallet.group_id == group_id, Wallet.user_id == user_id)
+                .with_for_update()
+            )
+            if wallet is None:
+                raise ValueError("玩家钱包不存在")
+            delta = amount if direction == "credit" else -amount
+            if wallet.balance + delta < 0:
+                await query.message.answer(f"下分失败：当前余额只有 {wallet.balance}。")
+                await state.clear()
+                return
+            wallet.balance += delta
+            action_row = AdminAction(
+                admin_user_id=admin_id,
+                group_id=group_id,
+                action="wallet_credit" if direction == "credit" else "wallet_debit",
+                details={"user_id": user_id, "amount": str(amount), "note": note},
+            )
+            session.add(action_row)
+            await session.flush()
+            session.add(
+                WalletLedger(
+                    wallet_id=wallet.id,
+                    idempotency_key=f"admin:{action_row.id}",
+                    entry_type="admin_credit" if direction == "credit" else "admin_debit",
+                    amount=delta,
+                    balance_after=wallet.balance,
+                    reference_type="admin_action",
+                    reference_id=action_row.id,
+                    note=note,
+                )
+            )
+        await state.clear()
+        await query.message.answer("操作已完成，账本和管理员日志均已记录。")
+        await _show(query, *(await _player_view(session_factory, group_id, user_id, "all")))
+    elif action == "ux":
+        values = await state.get_data()
+        await state.clear()
+        await _show(query, *(await _player_view(session_factory, int(values["group_id"]), int(values["user_id"]), "all")))
+    elif action == "r":
+        await _show(query, *(await _ranking_view(session_factory, int(parts[2]), parts[3])))
+    elif action == "rp":
+        await _show(query, *(await _report_view(session_factory, int(parts[2]))))
+    elif action == "l":
+        await _show(query, *(await _logs_view(session_factory, int(parts[2]))))
+    elif action == "bk":
+        await _show(query, *(await _backup_view()))
+    elif action == "bl":
+        await _show(query, *(await _backup_list_view()))
+    elif action == "bn":
+        await query.message.answer("正在生成并加密数据库备份，请稍候。")
+        try:
+            filename = await _create_backup(session_factory, admin_id)
+        except (OSError, RuntimeError, ValueError) as exc:
+            await query.message.answer(f"备份失败：{escape(str(exc))}", parse_mode=ParseMode.HTML)
+        else:
+            await query.message.answer(f"备份完成：<code>{escape(filename)}</code>", parse_mode=ParseMode.HTML)
+        await _show(query, *(await _backup_view()))
+    elif action == "br":
+        await _show(
+            query,
+            "<b>♻️ 恢复备份</b>\n\n恢复会先验证加密密钥和备份完整性，并自动创建恢复前快照。请在服务器项目目录执行：\n\n<code>bash scripts/linux/restore.sh backups/文件名.bwf</code>",
+            InlineKeyboardMarkup(inline_keyboard=[[_button("⬅️ 返回备份", "a:bk")]]),
+        )
+    elif action == "rules":
+        text = (
+            "<b>📖 三骰玩法</b>\n\n"
+            "大/小：3-10 小，11-18 大\n"
+            "单/双：按和值奇偶判断\n"
+            "组合：dd 大单、ds 大双、xd 小单、xs 小双\n"
+            "特殊：和值3-18、顺子、任意豹子、指定豹子111至666\n\n"
+            "下注示例：<code>大100、dd100、和值 10 100、顺子100、111 100</code>"
+        )
+        await _show(query, text, InlineKeyboardMarkup(inline_keyboard=[_home_button()]))
+    elif action == "pub":
+        group_id = int(parts[2])
+        rules = (
+            "📖 三骰玩法说明\n\n"
+            "大/小：和值3-10为小，11-18为大\n"
+            "单/双：按和值奇偶判断\n"
+            "组合：dd大单、ds大双、xd小单、xs小双\n"
+            "特殊：和值3-18、顺子、豹子、111至666指定豹子\n\n"
+            "下注示例：大100、dd100、和值 10 100、顺子100、111 100"
+        )
+        async with session_factory() as session, session.begin():
+            session.add(
+                OutboxMessage(
+                    group_id=group_id,
+                    sequence=0,
+                    message_type="text",
+                    payload={"text": rules},
+                    idempotency_key=f"admin-rules:{group_id}:{uuid.uuid4().hex}",
+                )
+            )
+            await _audit(session, admin_id, "rules_published", group_id)
+        await query.message.answer("玩法说明已加入该群发送队列。")
+        await _show(query, *(await _group_view(session_factory, group_id)))
+    elif action == "i":
+        group_id, kind = int(parts[2]), parts[3]
+        labels = {
+            "bs": ("下注窗口秒数", "1 至 3600 的整数"),
+            "rs": ("封盘到开奖秒数", "1 至 3600 的整数"),
+            "ns": ("结算到下一局秒数", "1 至 3600 的整数"),
+            "ps": ("玩家掷骰窗口秒数", "1 至 3600 的整数"),
+            "min": ("最低下注", "大于0，最多两位小数"),
+            "dice": ("玩家掷骰门槛", "大于0，最多两位小数"),
+            "cmin": ("签到最小值", "大于等于0，最多两位小数"),
+            "cmax": ("签到最大值", "大于等于0，最多两位小数"),
+            "cstep": ("签到步进", "大于0，最多两位小数"),
+            "history": ("走势期数", "28 至 280 的整数"),
+            "streak": ("连胜奖励档位", "格式：3=10,5=30,10=100"),
+        }
+        if kind in {"bs", "rs", "ns", "ps"}:
+            return_to = f"a:t:{group_id}"
+        elif kind in {"min", "dice"}:
+            return_to = f"a:b:{group_id}"
+        elif kind in {"cmin", "cmax", "cstep", "streak"}:
+            return_to = f"a:w:{group_id}"
+        elif kind == "history":
+            return_to = f"a:d:{group_id}"
+        else:
+            return_to = f"a:g:{group_id}"
+        await state.set_state(AdminInput.setting_value)
+        await state.set_data({"kind": kind, "group_id": group_id, "return_to": return_to})
+        label, hint = labels[kind]
+        await query.message.answer(
+            f"请输入 <b>{label}</b> 的新值。\n要求：{hint}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_button("取消", f"a:g:{group_id}")]]),
+        )
+
+
+@router.message(AdminInput.setting_value, F.chat.type == ChatType.PRIVATE)
+async def admin_setting_input(message: Message, session_factory, state: FSMContext) -> None:
+    if not is_super_admin(message.from_user.id if message.from_user else None):
+        return
+    values = await state.get_data()
+    kind = values["kind"]
+    group_id = int(values["group_id"])
+    raw = (message.text or "").strip()
+    return_to = values.get("return_to", f"a:g:{group_id}")
+    try:
+        async with session_factory() as session, session.begin():
+            settings = await session.get(GameSettings, group_id, with_for_update=True)
+            if settings is None:
+                raise ValueError("群设置不存在")
+            field = kind
+            saved: object
+            if kind == "odds":
+                odds = await session.get(OddsSetting, int(values["odds_id"]), with_for_update=True)
+                amount = Decimal(raw).quantize(Decimal("0.01"))
+                if odds is None or odds.group_id != group_id or amount <= 0:
+                    raise ValueError("返还倍数必须大于0")
+                odds.payout_multiplier = amount
+                odds.enabled = True
+                field = f"odds:{odds.bet_type}:{odds.bet_value}"
+                saved = amount
+                audit_action = "odds_changed"
+            elif kind == "streak":
+                rewards: dict[str, str] = {}
+                for item in raw.replace("，", ",").split(","):
+                    count_text, reward_text = item.split("=", 1)
+                    count = int(count_text.strip())
+                    reward = Decimal(reward_text.strip()).quantize(Decimal("0.01"))
+                    if count < 1 or reward <= 0:
+                        raise ValueError("连胜次数和奖励必须大于0")
+                    rewards[str(count)] = str(reward)
+                settings.streak_rewards = rewards
+                field = "streak_rewards"
+                saved = rewards
+                audit_action = "setting_changed"
+            elif kind in {"bs", "rs", "ns", "ps", "history"}:
+                value = int(raw)
+                if kind == "history":
+                    if not 28 <= value <= 280:
+                        raise ValueError("走势期数范围为28至280")
+                    field = "history_size"
+                else:
+                    if not 1 <= value <= 3600:
+                        raise ValueError("时间范围为1至3600秒")
+                    field = {"bs": "betting_seconds", "rs": "rolling_seconds", "ns": "next_round_seconds", "ps": "player_dice_seconds"}[kind]
+                setattr(settings, field, value)
+                saved = value
+                audit_action = "setting_changed"
+            else:
+                amount = Decimal(raw).quantize(Decimal("0.01"))
+                if kind in {"min", "dice", "cstep"} and amount <= 0:
+                    raise ValueError("数值必须大于0")
+                if kind in {"cmin", "cmax"} and amount < 0:
+                    raise ValueError("数值必须大于等于0")
+                field = {
+                    "min": "minimum_bet",
+                    "dice": "player_dice_threshold",
+                    "cmin": "checkin_min",
+                    "cmax": "checkin_max",
+                    "cstep": "checkin_step",
+                }[kind]
+                setattr(settings, field, amount)
+                if settings.checkin_min > settings.checkin_max:
+                    raise ValueError("签到最小值不得高于最大值")
+                saved = amount
+                audit_action = "setting_changed"
+            settings.version += 1
+            await _audit(
+                session,
+                message.from_user.id,
+                audit_action,
+                group_id,
+                field=field,
+                value=str(saved),
+            )
+    except (ValueError, InvalidOperation) as exc:
+        await message.answer(f"输入有误：{escape(str(exc))}。请重新输入。", parse_mode=ParseMode.HTML)
+        return
+    await state.clear()
+    await message.answer(
+        "设置已保存；游戏参数从下一期生效。",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_button("返回设置", return_to)]]),
+    )
+
+
+@router.message(AdminInput.player_search, F.chat.type == ChatType.PRIVATE)
+async def admin_player_search(message: Message, session_factory, state: FSMContext) -> None:
+    if not is_super_admin(message.from_user.id if message.from_user else None):
+        return
+    values = await state.get_data()
+    group_id = int(values["group_id"])
+    origin = getattr(message, "forward_origin", None)
+    forwarded_user = getattr(origin, "sender_user", None)
+    raw = (message.text or "").strip()
+    async with session_factory() as session:
+        query = select(User).join(Wallet, Wallet.user_id == User.id).distinct()
+        if group_id:
+            query = query.where(Wallet.group_id == group_id)
+        if forwarded_user is not None:
+            query = query.where(User.id == forwarded_user.id)
+        elif raw.lstrip("-").isdigit():
+            query = query.where(User.id == int(raw))
+        else:
+            username = raw.lstrip("@").strip()
+            query = query.where(func.lower(User.username) == username.lower())
+        users = (await session.scalars(query.limit(20))).all()
+    if not users:
+        await message.answer("该群数据库中没有找到这个玩家，请重新输入。")
+        return
+    await state.clear()
+    if len(users) == 1:
+        if group_id:
+            text, markup = await _player_view(session_factory, group_id, users[0].id, "all")
+        else:
+            text, markup = await _player_groups_view(session_factory, users[0].id)
+        await message.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        return
+    rows = [
+        [
+            _button(
+                f"{user.display_name} · {user.id}",
+                f"a:u:{group_id}:{user.id}:all" if group_id else f"a:ug:{user.id}",
+            )
+        ]
+        for user in users
+    ]
+    rows.append([_button("⬅️ 返回", f"a:pl:{group_id}:0" if group_id else "a:h")])
+    await message.answer("找到多个匹配玩家，请选择：", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.message(AdminInput.wallet_adjustment, F.chat.type == ChatType.PRIVATE)
+async def admin_wallet_input(message: Message, session_factory, state: FSMContext) -> None:
+    if not is_super_admin(message.from_user.id if message.from_user else None):
+        return
+    raw = (message.text or "").strip()
+    values = await state.get_data()
+    try:
+        amount_text, note = raw.split(maxsplit=1)
+        amount = Decimal(amount_text).quantize(Decimal("0.01"))
+        if amount <= 0:
+            raise ValueError
+    except (ValueError, InvalidOperation):
+        await message.answer("格式有误。请按“金额 备注”输入，例如：100 活动奖励。")
+        return
+    group_id, user_id = int(values["group_id"]), int(values["user_id"])
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        wallet = await session.scalar(
+            select(Wallet).where(Wallet.group_id == group_id, Wallet.user_id == user_id)
+        )
+    if user is None or wallet is None:
+        await state.clear()
+        await message.answer("玩家钱包不存在。")
+        return
+    if values["direction"] == "debit" and amount > wallet.balance:
+        await message.answer(f"下分金额超过当前余额 {wallet.balance}，请重新输入。")
+        return
+    await state.set_state(AdminInput.wallet_confirmation)
+    await state.update_data(amount=str(amount), note=note)
+    text = (
+        "<b>请确认本次钱包操作</b>\n\n"
+        f"玩家：{escape(user.display_name)}（<code>{user.id}</code>）\n"
+        f"当前余额：{wallet.balance}\n"
+        f"操作：{'上分' if values['direction'] == 'credit' else '下分'} {amount}\n"
+        f"备注：{escape(note)}"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[_button("✅ 确认执行", "a:uc"), _button("取消", "a:ux")]]
+    )
+    await message.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+
+@router.message(StateFilter(None), F.chat.type == ChatType.PRIVATE)
+async def private_admin_fallback(message: Message, session_factory) -> None:
+    if not is_super_admin(message.from_user.id if message.from_user else None):
+        return
+    text, markup = await _home_view(session_factory)
+    await message.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)

@@ -8,11 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from botwanfa.db.models import (
     Bet,
     DiceResult,
+    GameSettings,
     OutboxMessage,
     Round,
     RoundPlayerSettlement,
+    StreakReward,
     Wallet,
     WalletLedger,
+    WinningStreak,
 )
 from botwanfa.domain.bets import BetItem, BetType
 from botwanfa.domain.dice import evaluate_dice, is_winning_bet
@@ -39,6 +42,7 @@ class SettlementService:
             raise ValueError("缺少骰子结果")
         outcome = evaluate_dice((dice.die_1, dice.die_2, dice.die_3))
         bets = (await session.scalars(select(Bet).where(Bet.round_id == round_id))).all()
+        settings = await session.get(GameSettings, round_.group_id)
         by_user: dict[int, list[Bet]] = defaultdict(list)
         for bet in bets:
             by_user[bet.user_id].append(bet)
@@ -60,13 +64,63 @@ class SettlementService:
                 bet.payout = bet.amount * bet.odds_snapshot if bet.won else Decimal("0.00")
                 returned += bet.payout
             wallet.balance += returned
+            streak = await session.scalar(
+                select(WinningStreak)
+                .where(
+                    WinningStreak.group_id == round_.group_id,
+                    WinningStreak.user_id == user_id,
+                )
+                .with_for_update()
+            )
+            if streak is None:
+                streak = WinningStreak(
+                    group_id=round_.group_id,
+                    user_id=user_id,
+                    current_count=0,
+                    highest_count=0,
+                )
+                session.add(streak)
+            net = returned - wagered
+            if net > 0:
+                streak.current_count += 1
+                streak.highest_count = max(streak.highest_count, streak.current_count)
+            elif net < 0:
+                streak.current_count = 0
+            streak_reward = Decimal("0.00")
+            if settings and settings.streak_enabled and net > 0:
+                streak_reward = Decimal(
+                    settings.streak_rewards.get(str(streak.current_count), "0.00")
+                )
+            if streak_reward > 0:
+                wallet.balance += streak_reward
+                session.add(
+                    StreakReward(
+                        round_id=round_id,
+                        group_id=round_.group_id,
+                        user_id=user_id,
+                        streak_count=streak.current_count,
+                        reward=streak_reward,
+                    )
+                )
+                session.add(
+                    WalletLedger(
+                        wallet_id=wallet.id,
+                        idempotency_key=f"streak:{round_id}:{user_id}:{streak.current_count}",
+                        entry_type="streak_reward",
+                        amount=streak_reward,
+                        balance_after=wallet.balance,
+                        reference_type="round",
+                        reference_id=round_id,
+                        note=f"{streak.current_count}连胜奖励",
+                    )
+                )
             settlement = RoundPlayerSettlement(
                 round_id=round_id,
                 group_id=round_.group_id,
                 user_id=user_id,
                 wagered=wagered,
                 returned=returned,
-                net=returned - wagered,
+                net=net,
                 balance_after=wallet.balance,
             )
             session.add(settlement)

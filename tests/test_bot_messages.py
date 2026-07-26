@@ -16,7 +16,19 @@ def test_failure_message_escapes_name_and_mentions_by_id() -> None:
 def test_admin_menu_has_expected_buttons() -> None:
     markup = admin_menu_markup()
     labels = [button.text for row in markup.inline_keyboard for button in row]
-    assert "📊 运行状态" in labels
+    assert "📊 运行总览" in labels
     assert "🎮 群管理" in labels
+    assert "🔎 查询玩家" in labels
+    assert "💳 玩家上下分" in labels
+    assert "🏆 群排行榜" in labels
+    assert "📈 数据报表" in labels
+    assert "🧾 操作日志" in labels
+    assert "💾 备份恢复" in labels
+    assert "🧪 测试模式" in labels
     assert "📖 玩法说明" in labels
-    assert "🛠 部署命令" in labels
+
+
+def test_admin_callback_data_fits_telegram_limit() -> None:
+    markup = admin_menu_markup()
+    callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+    assert all(value is not None and len(value.encode()) <= 64 for value in callbacks)
