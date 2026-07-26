@@ -288,6 +288,20 @@ def settlement_text(
     return "\n".join(lines)
 
 
+def result_settlement_text(
+    round_number: int,
+    outcome: DiceOutcome,
+    source: str,
+    rows: Sequence[SettlementSummary],
+    *,
+    reference: str | None = None,
+) -> str:
+    return (
+        f"{result_caption(round_number, outcome, source, reference=reference)}\n\n"
+        f"{settlement_text(round_number, rows, reference=reference)}"
+    )
+
+
 def rules_text(odds: dict[tuple[str, str], Decimal], minimum_bet: Decimal) -> str:
     def odd(kind: str, value: str = "") -> str:
         current = odds.get((kind, value)) or odds.get((kind, ""))
@@ -519,6 +533,63 @@ def render_settlement_pages(
             y += 78
         output.append(_png(image))
     return output
+
+
+def render_settlement_image(
+    round_number: int,
+    rows: Sequence[SettlementSummary],
+    reference: str | None = None,
+) -> bytes:
+    width = 1500
+    height = max(530, 235 + len(rows) * 78)
+    image = Image.new("RGB", (width, height), CANVAS)
+    draw = ImageDraw.Draw(image)
+    total_wagered = sum((row.wagered for row in rows), Decimal("0.00"))
+    total_returned = sum((row.returned for row in rows), Decimal("0.00"))
+    _header(
+        draw,
+        title=f"第 {_round_label(round_number, reference)} 期  全员结算",
+        subtitle=(
+            f"共 {len(rows)} 位玩家  ·  投注 {money(total_wagered)}  ·  "
+            f"返还 {money(total_returned)}"
+        ),
+        width=width,
+        accent=GOLD,
+    )
+    headings = ((55, "玩家"), (650, "投注"), (850, "返还"), (1050, "净输赢"), (1280, "余额"))
+    for x, heading in headings:
+        draw.text((x, 172), heading, font=_font(24, True), fill=MUTED)
+    if not rows:
+        draw.text(
+            (width // 2, 335),
+            "本期无人投注",
+            font=_font(42, True),
+            fill=MUTED,
+            anchor="ma",
+        )
+    y = 218
+    for index, row in enumerate(rows, 1):
+        fill = PANEL if index % 2 else PANEL_ALT
+        draw.rectangle((35, y, width - 35, y + 66), fill=fill)
+        draw.text(
+            (55, y + 15),
+            f"{index:02d}  {row.display_name[:20]}",
+            font=_font(24, True),
+            fill=WHITE,
+        )
+        draw.text((650, y + 15), money(row.wagered), font=_font(24), fill=WHITE)
+        draw.text((850, y + 15), money(row.returned), font=_font(24), fill=WHITE)
+        net_color = GREEN if row.net > 0 else (RED if row.net < 0 else MUTED)
+        sign = "+" if row.net > 0 else ""
+        draw.text(
+            (1050, y + 15),
+            f"{sign}{money(row.net)}",
+            font=_font(24, True),
+            fill=net_color,
+        )
+        draw.text((1280, y + 15), money(row.balance), font=_font(24, True), fill=GOLD)
+        y += 78
+    return _png(image)
 
 
 def render_trend_image(points: Sequence[TrendPoint], current_round: int) -> bytes:

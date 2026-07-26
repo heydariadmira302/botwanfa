@@ -26,6 +26,7 @@ from botwanfa.db.models import (
     AdminAction,
     BackupRecord,
     BetBatch,
+    DeploymentControl,
     GameSettings,
     GroupMember,
     OddsSetting,
@@ -39,6 +40,7 @@ from botwanfa.db.models import (
     WinningStreak,
 )
 from botwanfa.presentation import TREND_MAX_POINTS, TREND_MIN_POINTS, rules_text
+from botwanfa.services.drain import load_drain_progress, set_draining
 
 router = Router(name="super_admin")
 PAGE_SIZE = 8
@@ -109,6 +111,8 @@ ACTION_LABELS = {
     "failed_message_deleted": "删除发送失败记录",
     "message_button_added": "添加消息按钮",
     "message_button_deleted": "删除消息按钮",
+    "deployment_drain_enabled": "开始平滑更新准备",
+    "deployment_drain_cancelled": "取消平滑更新准备",
 }
 MESSAGE_BUTTON_TEMPLATES = {
     "open": ("round_open", "开始下注"),
@@ -122,6 +126,7 @@ MESSAGE_TYPE_LABELS = {
     "round_open": "开始下注",
     "round_closed": "停止下注",
     "player_dice_invite": "玩家掷骰邀请",
+    "player_dice_ack": "玩家骰子识别回复",
     "dice_round": "机器人掷骰",
     "round_result": "开奖结果与结算",
     "trend_result": "历史开奖结果",
@@ -152,7 +157,8 @@ def admin_menu_markup() -> InlineKeyboardMarkup:
             [_button("🔎 查询玩家", "a:us:0"), _button("💳 玩家上下分", "a:gl:0:players")],
             [_button("🏆 群排行榜", "a:gl:0:ranking"), _button("📈 数据报表", "a:gl:0:report")],
             [_button("📨 发送队列", "a:mq:0"), _button("🧾 操作日志", "a:l:0")],
-            [_button("💾 备份恢复", "a:bk"), _button("🧪 测试模式", "a:gl:0:test")],
+            [_button("🛠 平滑更新", "a:dr"), _button("💾 备份恢复", "a:bk")],
+            [_button("🧪 测试模式", "a:gl:0:test")],
             [_button("📖 玩法说明", "a:rules")],
         ]
     )
@@ -175,6 +181,7 @@ async def _audit(session, admin_id: int, action: str, group_id: int | None, **de
 
 async def _home_view(session_factory) -> tuple[str, InlineKeyboardMarkup]:
     async with session_factory() as session:
+        deployment = await session.get(DeploymentControl, 1)
         groups = int(await session.scalar(select(func.count(TelegramGroup.id))) or 0)
         running = int(
             await session.scalar(
@@ -203,14 +210,77 @@ async def _home_view(session_factory) -> tuple[str, InlineKeyboardMarkup]:
             or 0
         )
     health = "🟢 正常" if failed_messages == 0 else f"🟠 有 {failed_messages} 条发送失败"
+    deployment_status = "正在排空，等待当前期完成" if deployment and deployment.draining else "正常运行"
     text = (
         "<b>BOTWANFA 管理中心</b>\n\n"
         f"系统状态：{health}\n"
+        f"更新状态：{deployment_status}\n"
         f"群组：{groups} 个  ·  运行：{running} 个  ·  暂停：{paused} 个\n"
         f"当前未完成期次：{active} 个\n\n"
         "请选择要执行的管理操作。"
     )
     return text, admin_menu_markup()
+
+
+async def _drain_view(session_factory) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        deployment = await session.get(DeploymentControl, 1)
+        progress = await load_drain_progress(
+            session,
+            failed_after_id=(
+                deployment.outbox_start_id
+                if deployment and deployment.draining
+                else None
+            ),
+            drain_started_at=(
+                deployment.requested_at
+                if deployment and deployment.draining
+                else None
+            ),
+        )
+    draining = bool(deployment and deployment.draining)
+    if not draining:
+        status = "🟢 正常运行"
+        summary = "各群会继续自动开始新期次。"
+    elif progress.ready:
+        status = "✅ 已排空，可以更新"
+        summary = "所有群当前期和关键消息均已处理完成。"
+    else:
+        status = "🟡 正在并行收尾"
+        summary = "已有期次继续运行，但所有群都不会再开始新一期。"
+    requested_at = "-"
+    if deployment and deployment.requested_at:
+        requested_at = deployment.requested_at.astimezone(get_settings().tz).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    text = (
+        "<b>🛠 平滑更新</b>\n\n"
+        f"当前状态：{status}\n"
+        f"开始时间：{requested_at}\n"
+        f"{summary}\n\n"
+        f"未完成期次：{progress.active_rounds}\n"
+        f"├ 开放下注：{progress.betting_rounds}\n"
+        f"├ 等待玩家掷骰：{progress.waiting_player_rounds}\n"
+        f"├ 封盘/机器人掷骰：{progress.rolling_rounds}\n"
+        f"├ 正在结算：{progress.settling_rounds}\n"
+        f"└ 异常阻塞：{progress.blocked_rounds}\n"
+        f"待发送关键消息：{progress.pending_round_messages}\n"
+        f"发送失败关键消息：{progress.failed_round_messages}\n\n"
+        "排空完成后，在服务器项目目录执行：\n"
+        "<code>bash scripts/linux/update.sh</code>"
+    )
+    if draining:
+        rows = [
+            [_button("🔄 刷新进度", "a:dr")],
+            [_button("取消更新准备", "a:dcx")],
+            _home_button(),
+        ]
+    else:
+        rows = [
+            [_button("开始准备更新", "a:dx")],
+            _home_button(),
+        ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _overview_view(session_factory) -> tuple[str, InlineKeyboardMarkup]:
@@ -1233,6 +1303,48 @@ async def admin_callback(
         await _show(query, *(await _home_view(session_factory)))
     elif action == "o":
         await _show(query, *(await _overview_view(session_factory)))
+    elif action == "dr":
+        await _show(query, *(await _drain_view(session_factory)))
+    elif action == "dx":
+        await _show(
+            query,
+            "<b>确认开始准备更新？</b>\n\n"
+            "确认后所有群会停止创建新期次；正在进行的期次继续下注、掷骰、开奖和结算，互不等待。",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [_button("确认开始", "a:de"), _button("取消", "a:dr")]
+                ]
+            ),
+        )
+    elif action == "de":
+        async with session_factory() as session, session.begin():
+            deployment = await set_draining(session, True, requested_by=admin_id)
+            await _audit(
+                session,
+                admin_id,
+                "deployment_drain_enabled",
+                None,
+                generation=deployment.generation,
+            )
+        await query.message.answer("已开始排空；各群当前期会并行完成，不会再开新一期。")
+        await _show(query, *(await _drain_view(session_factory)))
+    elif action == "dcx":
+        await _show(
+            query,
+            "<b>确认取消更新准备？</b>\n\n"
+            "取消后，已完成当前期的群会重新自动开始下一期。",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [_button("确认取消", "a:dc"), _button("继续等待", "a:dr")]
+                ]
+            ),
+        )
+    elif action == "dc":
+        async with session_factory() as session, session.begin():
+            await set_draining(session, False, requested_by=admin_id)
+            await _audit(session, admin_id, "deployment_drain_cancelled", None)
+        await query.message.answer("已取消更新准备，各群将恢复自动开新一期。")
+        await _show(query, *(await _drain_view(session_factory)))
     elif action == "mq":
         await _show(query, *(await _message_queue_view(session_factory, int(parts[2]))))
     elif action == "mr":

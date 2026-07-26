@@ -16,9 +16,11 @@ from botwanfa.presentation import (
     load_status_animation,
     open_caption,
     render_bet_summary_pages,
+    render_settlement_image,
     render_settlement_pages,
     render_trend_image,
     result_caption,
+    result_settlement_text,
     round_code,
     round_reference,
     rules_text,
@@ -184,7 +186,7 @@ def test_trend_image_never_grows_beyond_the_rolling_window() -> None:
     assert image_size(render_trend_image(points, 10000)) == (1680, 1169)
 
 
-def test_round_trend_and_normal_settlement_stay_separate() -> None:
+def test_result_and_normal_settlement_are_combined_after_the_trend() -> None:
     points = []
     for number in range(9917, 10001):
         dice = (number % 6 + 1, (number + 1) % 6 + 1, (number + 2) % 6 + 1)
@@ -213,9 +215,18 @@ def test_round_trend_and_normal_settlement_stay_separate() -> None:
     ]
     trend = render_trend_image(points, 10000)
     reference = round_reference(-100123, 10000)
-    text = settlement_text(10000, settlements, reference=reference)
+    outcome = evaluate_dice(points[-1].dice)
+    text = result_settlement_text(
+        10000,
+        outcome,
+        "bot",
+        settlements,
+        reference=reference,
+    )
     assert image_size(trend) == (1680, 1169)
     assert telegram_text_length(text) <= 4096
+    assert "开奖结果" in text
+    assert "结算完成" in text
     assert f"<code>{reference}</code>" in text
     assert all(f"tg://user?id={1000 + index}" in text for index in range(3))
 
@@ -264,3 +275,5 @@ def test_long_bet_and_settlement_lists_are_paginated_without_omission() -> None:
     settlement_pages = render_settlement_pages(99, oversized_settlements)
     assert len(settlement_pages) == 4
     assert all(image_size(page)[0] == 1500 for page in settlement_pages)
+    settlement_image = render_settlement_image(99, oversized_settlements)
+    assert image_size(settlement_image) == (1500, 6475)

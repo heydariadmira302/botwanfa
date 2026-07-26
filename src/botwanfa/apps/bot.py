@@ -20,6 +20,7 @@ from botwanfa.db.models import (
     DiceResult,
     GameSettings,
     OddsSetting,
+    OutboxMessage,
     Round,
     User,
     Wallet,
@@ -38,6 +39,29 @@ betting = BettingService()
 log = structlog.get_logger()
 __all__ = ["admin_menu_markup"]
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+
+
+def append_player_dice_roll(
+    snapshot: dict,
+    *,
+    message_id: int,
+    value: int,
+    accepted_at: datetime,
+) -> dict | None:
+    message_ids = list(snapshot.get("player_dice_message_ids", []))
+    if message_id in message_ids or len(message_ids) >= 3:
+        return None
+    values = list(snapshot.get("player_dice_values", []))
+    roll_times = list(snapshot.get("player_dice_times", []))
+    message_ids.append(message_id)
+    values.append(value)
+    roll_times.append(accepted_at.isoformat())
+    return {
+        **snapshot,
+        "player_dice_values": values,
+        "player_dice_message_ids": message_ids,
+        "player_dice_times": roll_times,
+    }
 
 
 async def ensure_participant(message: Message, session_factory) -> None:
@@ -234,8 +258,6 @@ async def collect_player_dice(message: Message, session_factory) -> None:
     user = message.from_user
     if user is None or message.dice is None or message.dice.emoji != "🎲":
         return
-    accepted_value: int | None = None
-    accepted_position = 0
     accepted_at = datetime.now(UTC)
     async with session_factory() as session, session.begin():
         round_ = await session.scalar(
@@ -261,19 +283,36 @@ async def collect_player_dice(message: Message, session_factory) -> None:
             snapshot["player_dice_deadline"] = deadline.isoformat()
         if deadline <= accepted_at:
             return
-        message_ids = list(snapshot.get("player_dice_message_ids", []))
-        if message.message_id in message_ids or len(message_ids) >= 3:
+        updated_snapshot = append_player_dice_roll(
+            snapshot,
+            message_id=message.message_id,
+            value=message.dice.value,
+            accepted_at=accepted_at,
+        )
+        if updated_snapshot is None:
             return
-        values = list(snapshot.get("player_dice_values", []))
-        message_ids.append(message.message_id)
-        values.append(message.dice.value)
-        accepted_value = message.dice.value
-        accepted_position = len(values)
-        round_.settings_snapshot = {
-            **snapshot,
-            "player_dice_values": values,
-            "player_dice_message_ids": message_ids,
-        }
+        values = list(updated_snapshot["player_dice_values"])
+        message_ids = list(updated_snapshot["player_dice_message_ids"])
+        round_.settings_snapshot = updated_snapshot
+        roll_time = accepted_at.astimezone(get_settings().tz).strftime("%H:%M:%S")
+        session.add(
+            OutboxMessage(
+                group_id=message.chat.id,
+                sequence=26 + len(values),
+                message_type="player_dice_ack",
+                payload={
+                    "round_id": round_.id,
+                    "reply_to_message_id": message.message_id,
+                    "text": (
+                        f"🎲 骰子有效，识别点数为: <b>{message.dice.value}</b>\n"
+                        f"摇骰子时间: <code>{roll_time}</code>"
+                    ),
+                },
+                idempotency_key=(
+                    f"round:{round_.id}:player-dice-ack:{message.message_id}"
+                ),
+            )
+        )
         if len(values) == 3:
             if await session.get(DiceResult, round_.id) is None:
                 session.add(
@@ -287,13 +326,6 @@ async def collect_player_dice(message: Message, session_factory) -> None:
                     )
                 )
             round_.status = RoundStatus.SETTLING.value
-    if accepted_value is not None:
-        roll_time = accepted_at.astimezone(get_settings().tz).strftime("%H:%M:%S")
-        await message.reply(
-            f"🎲 骰子有效，识别点数为：<b>{accepted_value}</b>\n"
-            f"摇骰子时间：<code>{roll_time}</code>\n"
-            f"已接收：{accepted_position}/3"
-        )
 
 
 def betting_unavailable_reason(round_: Round | None, now: datetime) -> str | None:

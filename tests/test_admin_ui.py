@@ -62,6 +62,7 @@ def test_main_player_actions_take_different_paths() -> None:
     }
     assert by_label["🔎 查询玩家"] == "a:us:0"
     assert by_label["💳 玩家上下分"] == "a:gl:0:players"
+    assert by_label["🛠 平滑更新"] == "a:dr"
 
 
 def test_odds_menu_has_four_categories_without_page_navigation() -> None:

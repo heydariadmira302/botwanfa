@@ -277,6 +277,23 @@ class ScheduledJob(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class DeploymentControl(Base):
+    __tablename__ = "deployment_control"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    draining: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
+    generation: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    requested_by: Mapped[int | None] = mapped_column(BigInteger)
+    outbox_start_id: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    ready_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class WinningStreak(Base):
     __tablename__ = "winning_streaks"
     __table_args__ = (UniqueConstraint("group_id", "user_id"),)

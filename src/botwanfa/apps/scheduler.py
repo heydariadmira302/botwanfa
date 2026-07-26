@@ -12,6 +12,7 @@ from botwanfa.db.session import create_engine_and_session
 from botwanfa.domain.state_machine import RoundStatus
 from botwanfa.logging import configure_logging
 from botwanfa.presentation import TREND_MAX_POINTS, TREND_MIN_POINTS
+from botwanfa.services.drain import get_deployment_control, load_drain_progress
 
 log = structlog.get_logger()
 ACTIVE = [
@@ -44,6 +45,7 @@ def choose_player_dice_candidate(batches, threshold: Decimal) -> int | None:
 async def tick(session_factory) -> None:
     now = datetime.now(UTC)
     async with session_factory() as session, session.begin():
+        deployment = await get_deployment_control(session, for_update=True)
         groups = (
             await session.scalars(
                 select(TelegramGroup).where(
@@ -64,6 +66,8 @@ async def tick(session_factory) -> None:
             if settings is None:
                 continue
             if active is None:
+                if deployment.draining:
+                    continue
                 last_round = await session.scalar(
                     select(Round)
                     .where(Round.group_id == group.id)
@@ -197,6 +201,7 @@ async def tick(session_factory) -> None:
                             "player_dice_deadline": None,
                             "player_dice_values": [],
                             "player_dice_message_ids": [],
+                            "player_dice_times": [],
                         }
                         session.add(
                             OutboxMessage(
@@ -262,6 +267,33 @@ async def tick(session_factory) -> None:
                         idempotency_key=f"round:{active.id}:dice",
                     )
                 )
+
+        if deployment.draining and deployment.ready_notified_at is None:
+            progress = await load_drain_progress(
+                session,
+                failed_after_id=deployment.outbox_start_id,
+                drain_started_at=deployment.requested_at,
+            )
+            if progress.ready:
+                for admin_id in get_settings().super_admin_ids:
+                    session.add(
+                        OutboxMessage(
+                            group_id=admin_id,
+                            sequence=0,
+                            message_type="text",
+                            payload={
+                                "text": (
+                                    "✅ 平滑更新准备完成\n\n"
+                                    "所有群的当前期次已结束，开奖和结算消息已发送完成。"
+                                    "现在可以在服务器执行更新命令。"
+                                )
+                            },
+                            idempotency_key=(
+                                f"deployment-drain:{deployment.generation}:ready:{admin_id}"
+                            ),
+                        )
+                    )
+                deployment.ready_notified_at = now
 
 
 async def run() -> None:

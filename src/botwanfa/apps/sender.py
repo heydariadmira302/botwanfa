@@ -20,8 +20,9 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    ReplyParameters,
 )
-from sqlalchemy import exists, func, select
+from sqlalchemy import exists, select
 from sqlalchemy.orm import aliased
 
 from botwanfa.config import get_settings
@@ -54,11 +55,11 @@ from botwanfa.presentation import (
     open_caption,
     player_mention,
     render_bet_summary_pages,
-    render_settlement_pages,
+    render_settlement_image,
     render_trend_image,
     result_caption,
+    result_settlement_text,
     round_reference,
-    settlement_text,
 )
 
 log = structlog.get_logger()
@@ -405,15 +406,6 @@ async def send_round_result(
                 .limit(history_size)
             )
         ).all()
-        participants = (
-            await session.execute(
-                select(User.id, User.display_name)
-                .join(BetBatch, BetBatch.user_id == User.id)
-                .where(BetBatch.round_id == round_id)
-                .group_by(User.id, User.display_name)
-                .order_by(func.min(BetBatch.created_at), User.id)
-            )
-        ).all()
     points = []
     for history_round, dice in reversed(history):
         outcome = evaluate_dice((dice.die_1, dice.die_2, dice.die_3))
@@ -432,54 +424,54 @@ async def send_round_result(
         (current_dice.die_1, current_dice.die_2, current_dice.die_3)
     )
     settlements = await load_settlement_summaries(session_factory, round_id)
-    caption = result_caption(
+    result = result_caption(
         round_number,
         current_outcome,
         current_dice.source,
         reference=reference,
-    )
-    caption = caption_with_player_mentions(
-        caption,
-        [(user_id, display_name) for user_id, display_name in participants],
     )
     if not payload.get("trend_sent"):
         image = await asyncio.to_thread(render_trend_image, points, round_number)
         await bot.send_photo(
             group_id,
             BufferedInputFile(image, filename=f"round-{round_number}-trend.png"),
-            caption=caption,
-            reply_markup=await load_template_markup(
-                session_factory, group_id, "round_result"
-            ),
+            caption=f"<b>📈 开奖走势</b>\n最近 {len(points)} 期，红框为本期。",
         )
         await save_outbox_progress(session_factory, outbox_id, trend_sent=True)
 
     if payload.get("settlement_sent"):
         return
-    summary = settlement_text(
+    summary = result_settlement_text(
         round_number,
+        current_outcome,
+        current_dice.source,
         settlements,
         reference=reference,
     )
+    result_markup = await load_template_markup(
+        session_factory, group_id, "round_result"
+    )
     if telegram_text_length(summary) <= 4096:
-        await bot.send_message(group_id, summary)
+        await bot.send_message(group_id, summary, reply_markup=result_markup)
     else:
-        pages = await asyncio.to_thread(
-            render_settlement_pages,
+        settlement_image = await asyncio.to_thread(
+            render_settlement_image,
             round_number,
             settlements,
             reference,
         )
         summary_caption = caption_with_player_mentions(
-            "<b>本期全员结算</b>\n人数较多，已转为结算图片。",
+            f"{result}\n\n<b>💰 结算完成</b>\n人数较多，完整结算见图。",
             [(row.user_id, row.display_name) for row in settlements],
         )
-        await send_photo_pages(
-            bot,
+        await bot.send_photo(
             group_id,
-            pages,
+            BufferedInputFile(
+                settlement_image,
+                filename=f"round-{round_number}-settlement.png",
+            ),
             caption=summary_caption,
-            filename_prefix=f"round-{round_number}-settlement",
+            reply_markup=result_markup,
         )
     await save_outbox_progress(session_factory, outbox_id, settlement_sent=True)
 
@@ -638,6 +630,15 @@ async def run() -> None:
                     await send_round_closed(bot, factory, group_id, payload)
                 elif message_type == "player_dice_invite":
                     await send_player_dice_invite(bot, factory, group_id, payload)
+                elif message_type == "player_dice_ack":
+                    await bot.send_message(
+                        group_id,
+                        payload["text"],
+                        reply_parameters=ReplyParameters(
+                            message_id=int(payload["reply_to_message_id"]),
+                            allow_sending_without_reply=True,
+                        ),
+                    )
                 elif message_type == "dice_round":
                     await send_dice_round(bot, factory, message_id, group_id, payload)
                 elif message_type in {"round_result", "trend_result"}:
