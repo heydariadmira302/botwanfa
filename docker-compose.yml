@@ -1,0 +1,67 @@
+x-app: &app
+  build: .
+  env_file: .env
+  restart: unless-stopped
+  volumes:
+    - ./backups:/app/backups
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: botwanfa
+      POSTGRES_USER: botwanfa
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U botwanfa -d botwanfa']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--requirepass', '${REDIS_PASSWORD}']
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD}', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    env_file: .env
+    command: ['alembic', 'upgrade', 'head']
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bot:
+    <<: *app
+    command: ['python', '-m', 'botwanfa', 'bot']
+
+  scheduler:
+    <<: *app
+    command: ['python', '-m', 'botwanfa', 'scheduler']
+
+  worker:
+    <<: *app
+    command: ['python', '-m', 'botwanfa', 'worker']
+
+  sender:
+    <<: *app
+    command: ['python', '-m', 'botwanfa', 'sender']
+
+volumes:
+  postgres_data:
+  redis_data:
