@@ -396,28 +396,6 @@ async def _delete_failed_messages(
             query = query.where(OutboxMessage.id == message_id)
         rows = (await session.scalars(query)).all()
         for row in rows:
-            if row.message_type in {"dice_round", "player_dice_invite"}:
-                round_id = int(row.payload["round_id"])
-                round_ = await session.get(Round, round_id, with_for_update=True)
-                if round_:
-                    round_.status = "bot_rolling"
-                recovery_payload = (
-                    row.payload
-                    if row.message_type == "dice_round"
-                    else {
-                        "round_id": round_id,
-                        "round_number": int(row.payload["round_number"]),
-                    }
-                )
-                session.add(
-                    OutboxMessage(
-                        group_id=row.group_id,
-                        sequence=30,
-                        message_type="dice_round",
-                        payload=recovery_payload,
-                        idempotency_key=f"admin-recovery:{row.id}:{uuid.uuid4().hex}",
-                    )
-                )
             await session.delete(row)
         if rows:
             await _audit(
@@ -1275,8 +1253,7 @@ async def admin_callback(
         await _show(
             query,
             f"<b>确认删除失败记录 #{message_id}？</b>\n\n"
-            "普通通知删除后不再发送；开奖相关记录会自动创建机器人恢复任务。"
-            "操作会写入管理员日志。",
+            "删除后该记录不会再次发送，操作会写入管理员日志。",
             InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -1299,8 +1276,7 @@ async def admin_callback(
         await _show(
             query,
             "<b>确认批量删除发送失败记录？</b>\n\n"
-            "普通通知会直接删除；开奖相关失败记录删除后，系统会创建机器人恢复任务，"
-            "避免当前期次中断。",
+            "确认后会删除当前全部发送失败记录，且不再重新发送。",
             InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
