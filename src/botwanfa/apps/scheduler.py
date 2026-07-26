@@ -154,15 +154,29 @@ async def tick(session_factory) -> None:
                         idempotency_key=f"round:{active.id}:closed",
                     )
                 )
+                batches = (
+                    await session.scalars(
+                        select(BetBatch)
+                        .where(BetBatch.round_id == active.id)
+                        .order_by(BetBatch.created_at, BetBatch.id)
+                    )
+                ).all()
                 threshold_text = active.settings_snapshot.get("player_dice_threshold")
-                if threshold_text is not None:
-                    batches = (
-                        await session.scalars(
-                            select(BetBatch)
-                            .where(BetBatch.round_id == active.id)
-                            .order_by(BetBatch.created_at, BetBatch.id)
+                if not batches:
+                    active.status = RoundStatus.BOT_ROLLING.value
+                    session.add(
+                        OutboxMessage(
+                            group_id=group.id,
+                            sequence=30,
+                            message_type="dice_round",
+                            payload={
+                                "round_id": active.id,
+                                "round_number": active.round_number,
+                            },
+                            idempotency_key=f"round:{active.id}:dice",
                         )
-                    ).all()
+                    )
+                elif threshold_text is not None:
                     candidate = choose_player_dice_candidate(batches, Decimal(threshold_text))
                     if candidate is not None:
                         configured_player_seconds = int(

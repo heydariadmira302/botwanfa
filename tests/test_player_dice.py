@@ -30,3 +30,9 @@ def test_equal_total_uses_earliest_threshold_time() -> None:
 
 def test_no_player_reaches_dice_threshold() -> None:
     assert choose_player_dice_candidate([batch(1, 10, "99", 1)], Decimal(100)) is None
+
+
+def test_default_threshold_selects_highest_bettor_and_empty_round_selects_nobody() -> None:
+    batches = [batch(1, 10, "20", 1), batch(2, 20, "50", 2), batch(3, 10, "40", 3)]
+    assert choose_player_dice_candidate(batches, Decimal("0.01")) == 10
+    assert choose_player_dice_candidate([], Decimal("0.01")) is None

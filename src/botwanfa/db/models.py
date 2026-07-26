@@ -102,10 +102,12 @@ class GameSettings(Base):
     betting_seconds: Mapped[int] = mapped_column(Integer, default=30)
     rolling_seconds: Mapped[int] = mapped_column(Integer, default=10)
     next_round_seconds: Mapped[int] = mapped_column(Integer, default=15)
-    player_dice_seconds: Mapped[int] = mapped_column(Integer, default=10)
+    player_dice_seconds: Mapped[int] = mapped_column(
+        Integer, default=25, server_default="25"
+    )
     minimum_bet: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("1.00"))
     player_dice_threshold: Mapped[Decimal | None] = mapped_column(
-        MONEY, default=Decimal("999999999.00")
+        MONEY, default=Decimal("0.01"), server_default="0.01"
     )
     history_size: Mapped[int] = mapped_column(Integer, default=84)
     checkin_min: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0.10"))
@@ -116,6 +118,9 @@ class GameSettings(Base):
         JSON, default=lambda: {"3": "10.00", "5": "30.00", "10": "100.00"}
     )
     test_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    message_buttons: Mapped[dict[str, list[dict[str, str]]]] = mapped_column(
+        JSON, default=dict, server_default=text("'{}'::json")
+    )
     version: Mapped[int] = mapped_column(Integer, default=1)
     effective_from_round: Mapped[int | None] = mapped_column(BigInteger)
 

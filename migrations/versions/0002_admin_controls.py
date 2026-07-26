@@ -10,41 +10,40 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "game_settings",
+    existing = {
+        column["name"]
+        for column in sa.inspect(op.get_bind()).get_columns("game_settings")
+    }
+    columns = (
         sa.Column("checkin_min", sa.Numeric(20, 2), nullable=False, server_default="0.10"),
-    )
-    op.add_column(
-        "game_settings",
         sa.Column("checkin_max", sa.Numeric(20, 2), nullable=False, server_default="0.50"),
-    )
-    op.add_column(
-        "game_settings",
         sa.Column("checkin_step", sa.Numeric(20, 2), nullable=False, server_default="0.10"),
-    )
-    op.add_column(
-        "game_settings",
         sa.Column("streak_enabled", sa.Boolean(), nullable=False, server_default=sa.true()),
-    )
-    op.add_column(
-        "game_settings",
         sa.Column(
             "streak_rewards",
             sa.JSON(),
             nullable=False,
             server_default=sa.text("'{\"3\": \"10.00\", \"5\": \"30.00\", \"10\": \"100.00\"}'::json"),
         ),
-    )
-    op.add_column(
-        "game_settings",
         sa.Column("test_mode", sa.Boolean(), nullable=False, server_default=sa.false()),
     )
+    for column in columns:
+        if column.name not in existing:
+            op.add_column("game_settings", column)
 
 
 def downgrade() -> None:
-    op.drop_column("game_settings", "test_mode")
-    op.drop_column("game_settings", "streak_rewards")
-    op.drop_column("game_settings", "streak_enabled")
-    op.drop_column("game_settings", "checkin_step")
-    op.drop_column("game_settings", "checkin_max")
-    op.drop_column("game_settings", "checkin_min")
+    existing = {
+        column["name"]
+        for column in sa.inspect(op.get_bind()).get_columns("game_settings")
+    }
+    for name in (
+        "test_mode",
+        "streak_rewards",
+        "streak_enabled",
+        "checkin_step",
+        "checkin_max",
+        "checkin_min",
+    ):
+        if name in existing:
+            op.drop_column("game_settings", name)

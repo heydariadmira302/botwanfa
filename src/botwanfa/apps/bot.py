@@ -73,7 +73,7 @@ async def start(message: Message, session_factory) -> None:
     await ensure_participant(message, session_factory)
     await message.reply(
         "<b>BOTWANFA 已连接本群</b>\n\n"
-        "机器人会自动开盘、封盘、发送三颗原生骰子、生成走势图并结算。\n"
+        "机器人会自动开盘、封盘，邀请最高下注者掷骰并在超时后自动补发，随后生成走势图并结算。\n"
         "发送 /玩法 查看完整规则，发送 余额、签到、日榜、周榜或月榜查询个人数据。",
         parse_mode=ParseMode.HTML,
     )
@@ -247,6 +247,9 @@ async def collect_player_dice(message: Message, session_factory) -> None:
     user = message.from_user
     if user is None or message.dice is None or message.dice.emoji != "🎲":
         return
+    accepted_value: int | None = None
+    accepted_position = 0
+    accepted_at = datetime.now(UTC)
     async with session_factory() as session, session.begin():
         round_ = await session.scalar(
             select(Round)
@@ -266,10 +269,10 @@ async def collect_player_dice(message: Message, session_factory) -> None:
             deadline = datetime.fromisoformat(deadline_text)
         else:
             deadline = datetime.now(UTC) + timedelta(
-                seconds=int(snapshot.get("player_dice_seconds", 10))
+                seconds=int(snapshot.get("player_dice_seconds", 25))
             )
             snapshot["player_dice_deadline"] = deadline.isoformat()
-        if deadline <= datetime.now(UTC):
+        if deadline <= accepted_at:
             return
         message_ids = list(snapshot.get("player_dice_message_ids", []))
         if message.message_id in message_ids or len(message_ids) >= 3:
@@ -277,6 +280,8 @@ async def collect_player_dice(message: Message, session_factory) -> None:
         values = list(snapshot.get("player_dice_values", []))
         message_ids.append(message.message_id)
         values.append(message.dice.value)
+        accepted_value = message.dice.value
+        accepted_position = len(values)
         round_.settings_snapshot = {
             **snapshot,
             "player_dice_values": values,
@@ -295,6 +300,13 @@ async def collect_player_dice(message: Message, session_factory) -> None:
                     )
                 )
             round_.status = RoundStatus.SETTLING.value
+    if accepted_value is not None:
+        roll_time = accepted_at.astimezone(get_settings().tz).strftime("%H:%M:%S")
+        await message.reply(
+            f"🎲 骰子有效，识别点数为：<b>{accepted_value}</b>\n"
+            f"摇骰子时间：<code>{roll_time}</code>\n"
+            f"已接收：{accepted_position}/3"
+        )
 
 
 def betting_unavailable_reason(round_: Round | None, now: datetime) -> str | None:

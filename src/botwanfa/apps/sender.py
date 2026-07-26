@@ -14,7 +14,12 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramServerError,
 )
-from aiogram.types import BufferedInputFile, InputMediaPhoto
+from aiogram.types import (
+    BufferedInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+)
 from sqlalchemy import exists, func, select
 from sqlalchemy.orm import aliased
 
@@ -23,6 +28,7 @@ from botwanfa.db.models import (
     Bet,
     BetBatch,
     DiceResult,
+    GameSettings,
     OutboxMessage,
     Round,
     RoundPlayerSettlement,
@@ -45,12 +51,44 @@ from botwanfa.presentation import (
     closed_caption,
     load_status_animation,
     open_caption,
+    player_mention,
     render_bet_summary_pages,
     render_round_result_image,
     result_caption,
+    round_reference,
 )
 
 log = structlog.get_logger()
+
+
+def template_message_markup(
+    message_buttons: dict | None, template_key: str
+) -> InlineKeyboardMarkup | None:
+    configured = (message_buttons or {}).get(template_key, [])
+    buttons = []
+    for item in configured[:8]:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text", "")).strip()
+        url = str(item.get("url", "")).strip()
+        if text and url:
+            buttons.append(InlineKeyboardButton(text=text, url=url))
+    if not buttons:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+    )
+
+
+async def load_template_markup(
+    session_factory, group_id: int, template_key: str
+) -> InlineKeyboardMarkup | None:
+    async with session_factory() as session:
+        settings = await session.get(GameSettings, group_id)
+    return template_message_markup(
+        settings.message_buttons if settings else None,
+        template_key,
+    )
 
 
 async def claim_one(session_factory) -> tuple[int, int, str, dict] | None:
@@ -156,16 +194,19 @@ async def send_photo_pages(
         await bot.send_media_group(group_id, media=media)
 
 
-async def send_round_open(bot: Bot, group_id: int, payload: dict) -> None:
+async def send_round_open(bot: Bot, session_factory, group_id: int, payload: dict) -> None:
+    round_number = int(payload["round_number"])
     caption = open_caption(
-        round_number=int(payload["round_number"]),
+        round_number=round_number,
         betting_seconds=int(payload["betting_seconds"]),
         minimum_bet=Decimal(payload["minimum_bet"]),
+        reference=round_reference(group_id, round_number),
     )
     await bot.send_animation(
         group_id,
         BufferedInputFile(load_status_animation("open"), filename="betting-open.gif"),
         caption=caption,
+        reply_markup=await load_template_markup(session_factory, group_id, "round_open"),
     )
 
 
@@ -221,6 +262,10 @@ async def send_round_closed(
     round_id = int(payload["round_id"])
     round_number = int(payload["round_number"])
     summaries, bet_count, turnover = await load_bet_summaries(session_factory, round_id)
+    reference = round_reference(group_id, round_number)
+    reply_markup = await load_template_markup(
+        session_factory, group_id, "round_closed"
+    )
     async with session_factory() as session:
         round_ = await session.get(Round, round_id)
     rolling_seconds = int(
@@ -231,6 +276,7 @@ async def send_round_closed(
         player_count=len(summaries),
         bet_count=bet_count,
         turnover=turnover,
+        reference=reference,
     )
     full_text = closed_bet_text(
         round_number=round_number,
@@ -238,23 +284,28 @@ async def send_round_closed(
         bet_count=bet_count,
         turnover=turnover,
         rolling_seconds=rolling_seconds,
+        reference=reference,
     )
     if len(full_text) <= 900:
         await bot.send_animation(
             group_id,
             BufferedInputFile(load_status_animation("closed"), filename="betting-closed.gif"),
             caption=full_text,
+            reply_markup=reply_markup,
         )
         return
     await bot.send_animation(
         group_id,
         BufferedInputFile(load_status_animation("closed"), filename="betting-closed.gif"),
         caption=caption,
+        reply_markup=reply_markup,
     )
     if len(full_text) <= 3900:
         await bot.send_message(group_id, full_text)
         return
-    summary_pages = await asyncio.to_thread(render_bet_summary_pages, round_number, summaries)
+    summary_pages = await asyncio.to_thread(
+        render_bet_summary_pages, round_number, summaries, reference
+    )
     summary_caption = caption_with_player_mentions(
         "<b>本期下注清单</b>",
         [(row.user_id, row.display_name) for row in summaries],
@@ -272,25 +323,35 @@ async def send_player_dice_invite(
     bot: Bot, session_factory, group_id: int, payload: dict
 ) -> None:
     round_id = int(payload["round_id"])
+    round_number = int(payload["round_number"])
     user_id = int(payload["user_id"])
     seconds = int(payload["seconds"])
+    summaries, _, _ = await load_bet_summaries(session_factory, round_id)
     async with session_factory() as session:
         user = await session.get(User, user_id)
     display_name = user.display_name if user else f"玩家 {user_id}"
+    player = next((row for row in summaries if row.user_id == user_id), None)
+    bet_text = "、".join(player.items) if player else "本期有效投注"
+    deadline = datetime.now(UTC) + timedelta(seconds=seconds)
+    deadline_text = deadline.astimezone(get_settings().tz).strftime("%H:%M:%S")
+    mention = player_mention(user_id, display_name)
     await bot.send_message(
         group_id,
-        f"🎲 <a href=\"tg://user?id={user_id}\">{escape(display_name)}</a>"
-        " 已达到本期掷骰门槛。\n"
-        f"请在 <b>{seconds} 秒</b>内连续发送三颗 Telegram 原生骰子。",
+        f"——<code>{round_reference(group_id, round_number)}</code>期下注玩家——\n"
+        f"{mention}　{escape(bet_text)} 💰\n\n"
+        f"<b>{mention} 请开始摇骰子（{seconds}秒内，{deadline_text}之前）</b>\n"
+        "点击复制👉 <code>🎲</code>，并从 Telegram 骰子面板连续发送三颗原生骰子。\n"
+        "💡 请尽快摇骰子，超时由机器人补发；以机器人识别录入结果为准。",
+        reply_markup=await load_template_markup(
+            session_factory, group_id, "player_dice_invite"
+        ),
     )
     async with session_factory() as session, session.begin():
         round_ = await session.get(Round, round_id, with_for_update=True)
         if round_ and round_.status == RoundStatus.WAITING_FOR_PLAYER_DICE.value:
             round_.settings_snapshot = {
                 **round_.settings_snapshot,
-                "player_dice_deadline": (
-                    datetime.now(UTC) + timedelta(seconds=seconds)
-                ).isoformat(),
+                "player_dice_deadline": deadline.isoformat(),
             }
 
 
@@ -299,6 +360,7 @@ async def send_round_result(
 ) -> None:
     round_id = int(payload["round_id"])
     round_number = int(payload["round_number"])
+    reference = round_reference(group_id, round_number)
     async with session_factory() as session:
         current_round = await session.get(Round, round_id)
         current_dice = await session.get(DiceResult, round_id)
@@ -354,7 +416,12 @@ async def send_round_result(
     image = await asyncio.to_thread(
         render_round_result_image, points, round_number, settlements
     )
-    caption = result_caption(round_number, current_outcome, current_dice.source)
+    caption = result_caption(
+        round_number,
+        current_outcome,
+        current_dice.source,
+        reference=reference,
+    )
     caption = caption_with_player_mentions(
         caption,
         [(user_id, display_name) for user_id, display_name in participants],
@@ -365,12 +432,18 @@ async def send_round_result(
             group_id,
             BufferedInputFile(image, filename=filename),
             caption=caption,
+            reply_markup=await load_template_markup(
+                session_factory, group_id, "round_result"
+            ),
         )
     else:
         await bot.send_document(
             group_id,
             BufferedInputFile(image, filename=filename),
             caption=caption,
+            reply_markup=await load_template_markup(
+                session_factory, group_id, "round_result"
+            ),
         )
 
 
@@ -504,7 +577,17 @@ async def run() -> None:
             combined_result_sent = False
             try:
                 if message_type == "text":
-                    sent = await bot.send_message(group_id, payload["text"])
+                    sent = await bot.send_message(
+                        group_id,
+                        payload["text"],
+                        reply_markup=(
+                            await load_template_markup(
+                                factory, group_id, str(payload["button_template"])
+                            )
+                            if payload.get("button_template")
+                            else None
+                        ),
+                    )
                     if payload.get("pin"):
                         try:
                             await bot.pin_chat_message(
@@ -513,7 +596,7 @@ async def run() -> None:
                         except TelegramBadRequest as exc:
                             log.warning("pin_rules_failed", group_id=group_id, error=str(exc))
                 elif message_type == "round_open":
-                    await send_round_open(bot, group_id, payload)
+                    await send_round_open(bot, factory, group_id, payload)
                 elif message_type == "round_closed":
                     await send_round_closed(bot, factory, group_id, payload)
                 elif message_type == "player_dice_invite":

@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from html import escape
 from pathlib import Path
+from urllib.parse import urlparse
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType, ParseMode
@@ -104,11 +105,32 @@ ACTION_LABELS = {
     "test_mode_disabled": "关闭测试模式",
     "rules_published": "发送玩法说明",
     "backup_created": "立即备份",
+    "message_retried": "重试发送消息",
+    "message_button_added": "添加消息按钮",
+    "message_button_deleted": "删除消息按钮",
+}
+MESSAGE_BUTTON_TEMPLATES = {
+    "open": ("round_open", "开始下注"),
+    "closed": ("round_closed", "停止下注"),
+    "dice": ("player_dice_invite", "玩家掷骰邀请"),
+    "result": ("round_result", "开奖结果与结算"),
+    "rules": ("rules", "玩法说明"),
+}
+MESSAGE_TYPE_LABELS = {
+    "text": "文字通知",
+    "round_open": "开始下注",
+    "round_closed": "停止下注",
+    "player_dice_invite": "玩家掷骰邀请",
+    "dice_round": "机器人掷骰",
+    "round_result": "开奖结果与结算",
+    "trend_result": "历史开奖结果",
+    "settlement_summary": "历史结算通知",
 }
 
 
 class AdminInput(StatesGroup):
     setting_value = State()
+    message_button = State()
     player_search = State()
     wallet_adjustment = State()
     wallet_confirmation = State()
@@ -128,8 +150,9 @@ def admin_menu_markup() -> InlineKeyboardMarkup:
             [_button("📊 运行总览", "a:o"), _button("🎮 群管理", "a:gl:0:manage")],
             [_button("🔎 查询玩家", "a:us:0"), _button("💳 玩家上下分", "a:gl:0:players")],
             [_button("🏆 群排行榜", "a:gl:0:ranking"), _button("📈 数据报表", "a:gl:0:report")],
-            [_button("🧾 操作日志", "a:l:0"), _button("💾 备份恢复", "a:bk")],
-            [_button("🧪 测试模式", "a:gl:0:test"), _button("📖 玩法说明", "a:rules")],
+            [_button("📨 发送队列", "a:mq:0"), _button("🧾 操作日志", "a:l:0")],
+            [_button("💾 备份恢复", "a:bk"), _button("🧪 测试模式", "a:gl:0:test")],
+            [_button("📖 玩法说明", "a:rules")],
         ]
     )
 
@@ -226,9 +249,183 @@ async def _overview_view(session_factory) -> tuple[str, InlineKeyboardMarkup]:
         "服务：bot / scheduler / worker / sender / PostgreSQL / Redis"
     )
     markup = InlineKeyboardMarkup(
-        inline_keyboard=[[_button("🔄 刷新", "a:o")], _home_button()]
+        inline_keyboard=[
+            [_button("📨 查看发送队列", "a:mq:0"), _button("🔄 刷新", "a:o")],
+            _home_button(),
+        ]
     )
     return text, markup
+
+
+def parse_message_button_input(raw: str) -> tuple[str, str]:
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) >= 2:
+        label, url = lines[0], lines[1]
+    elif len(lines) == 1 and "|" in lines[0]:
+        label, url = (part.strip() for part in lines[0].split("|", 1))
+    elif len(lines) == 1:
+        parts = lines[0].rsplit(maxsplit=1)
+        if len(parts) != 2:
+            raise ValueError("请分两行输入按钮文字和链接")
+        label, url = parts
+    else:
+        raise ValueError("按钮文字和链接不能为空")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("链接必须是完整的 http:// 或 https:// 地址")
+    if not 1 <= len(label) <= 32:
+        raise ValueError("按钮文字长度应为1至32个字符")
+    if len(url) > 2048:
+        raise ValueError("链接过长")
+    return label, url
+
+
+async def _message_queue_view(
+    session_factory, page: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    page = max(0, page)
+    async with session_factory() as session:
+        total = int(
+            await session.scalar(
+                select(func.count(OutboxMessage.id)).where(
+                    OutboxMessage.status == "failed"
+                )
+            )
+            or 0
+        )
+        rows = (
+            await session.scalars(
+                select(OutboxMessage)
+                .where(OutboxMessage.status == "failed")
+                .order_by(OutboxMessage.id.desc())
+                .offset(page * PAGE_SIZE)
+                .limit(PAGE_SIZE)
+            )
+        ).all()
+    if total == 0:
+        text = "<b>📨 发送队列</b>\n\n🟢 当前没有发送失败的消息。"
+    else:
+        lines = [
+            "<b>📨 发送失败队列</b>",
+            "",
+            f"共 {total} 条，第 {page + 1} 页。请先查看错误原因，再选择重试。",
+        ]
+        for row in rows:
+            message_type = MESSAGE_TYPE_LABELS.get(row.message_type, row.message_type)
+            error = (row.last_error or "未记录错误").replace("\n", " ")[:140]
+            lines.extend(
+                (
+                    "",
+                    f"<b>#{row.id} · {escape(message_type)}</b>",
+                    f"群：<code>{row.group_id}</code> · 已尝试 {row.attempt_count} 次",
+                    f"原因：<code>{escape(error)}</code>",
+                )
+            )
+        text = "\n".join(lines)
+    buttons = [
+        [_button(f"🔄 重试 #{row.id}", f"a:mr:{row.id}:{page}")]
+        for row in rows
+    ]
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(_button("⬅️ 上一页", f"a:mq:{page - 1}"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(_button("下一页 ➡️", f"a:mq:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    if total:
+        buttons.append([_button("🔄 全部重试", "a:ma")])
+    buttons.append([_button("刷新", f"a:mq:{page}"), _button("🏠 首页", "a:h")])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _retry_failed_messages(
+    session_factory, admin_id: int, message_id: int | None = None
+) -> int:
+    async with session_factory() as session, session.begin():
+        query = (
+            select(OutboxMessage)
+            .where(OutboxMessage.status == "failed")
+            .with_for_update()
+        )
+        if message_id is not None:
+            query = query.where(OutboxMessage.id == message_id)
+        rows = (await session.scalars(query)).all()
+        for row in rows:
+            row.status = "pending"
+            row.available_at = datetime.now(UTC)
+            row.last_error = None
+            if row.message_type == "dice_round" and row.payload.get("round_id"):
+                round_ = await session.get(
+                    Round, int(row.payload["round_id"]), with_for_update=True
+                )
+                if round_ and round_.status == "manual_review":
+                    round_.status = "bot_rolling"
+        if rows:
+            await _audit(
+                session,
+                admin_id,
+                "message_retried",
+                None,
+                message_id=message_id,
+                count=len(rows),
+            )
+    return len(rows)
+
+
+async def _message_buttons_view(
+    session_factory, group_id: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        settings = await session.get(GameSettings, group_id)
+    if group is None or settings is None:
+        return await _group_view(session_factory, group_id)
+    configured = settings.message_buttons or {}
+    rows = []
+    for code, (key, label) in MESSAGE_BUTTON_TEMPLATES.items():
+        count = len(configured.get(key, []))
+        rows.append([_button(f"{label} · {count}/8", f"a:mt:{group_id}:{code}")])
+    rows.append([_button("⬅️ 返回群控制台", f"a:g:{group_id}")])
+    text = (
+        f"<b>🔗 {escape(group.title)} · 消息按钮</b>\n\n"
+        "每类消息可配置最多 8 个跳转按钮；未配置的消息保持无按钮。"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _message_button_template_view(
+    session_factory, group_id: int, code: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    key, label = MESSAGE_BUTTON_TEMPLATES[code]
+    async with session_factory() as session:
+        group = await session.get(TelegramGroup, group_id)
+        settings = await session.get(GameSettings, group_id)
+    if group is None or settings is None:
+        return await _group_view(session_factory, group_id)
+    configured = list((settings.message_buttons or {}).get(key, []))
+    lines = [f"<b>🔗 {escape(label)} · 消息按钮</b>", ""]
+    if configured:
+        for index, item in enumerate(configured, 1):
+            lines.append(
+                f"{index}. {escape(str(item.get('text', '')))}\n"
+                f"   <code>{escape(str(item.get('url', ''))[:180])}</code>"
+            )
+    else:
+        lines.append("当前没有按钮。")
+    rows = [
+        [
+            _button(
+                f"🗑 删除 {index + 1} · {str(item.get('text', ''))[:16]}",
+                f"a:md:{group_id}:{code}:{index}",
+            )
+        ]
+        for index, item in enumerate(configured)
+    ]
+    if len(configured) < 8:
+        rows.append([_button("➕ 添加按钮", f"a:mb:{group_id}:{code}")])
+    rows.append([_button("⬅️ 返回消息分类", f"a:mv:{group_id}")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _group_target(mode: str, group_id: int) -> str:
@@ -309,7 +506,12 @@ async def _group_view(session_factory, group_id: int) -> tuple[str, InlineKeyboa
         else "等待下一期"
     )
     threshold = settings.player_dice_threshold
-    threshold_text = "关闭" if threshold is None else str(threshold)
+    if threshold is None:
+        threshold_text = "关闭"
+    elif threshold <= Decimal("0.01"):
+        threshold_text = "默认最高下注者"
+    else:
+        threshold_text = str(threshold)
     test_text = "开启" if settings.test_mode else "关闭"
     text = (
         f"<b>🎮 {escape(group.title or f'群 {group.id}')}</b>\n"
@@ -332,7 +534,7 @@ async def _group_view(session_factory, group_id: int) -> tuple[str, InlineKeyboa
             [_button("🎯 倍率设置", f"a:oc:{group_id}"), _button("🎁 签到与连胜", f"a:w:{group_id}")],
             [_button("👤 玩家管理", f"a:pl:{group_id}:0"), _button("🏆 排行榜", f"a:r:{group_id}:day")],
             [_button("📈 走势与报表", f"a:d:{group_id}"), _button("🧪 测试模式", f"a:x:{group_id}")],
-            [_button("📣 发送玩法说明", f"a:pub:{group_id}")],
+            [_button("🔗 消息按钮", f"a:mv:{group_id}"), _button("📣 发送玩法说明", f"a:pub:{group_id}")],
             [_button("⬅️ 群列表", "a:gl:0:manage"), _button("🏠 首页", "a:h")],
         ]
     )
@@ -374,12 +576,18 @@ async def _basic_view(session_factory, group_id: int) -> tuple[str, InlineKeyboa
         settings = await session.get(GameSettings, group_id)
     if group is None or settings is None:
         return await _group_view(session_factory, group_id)
-    threshold = "关闭" if settings.player_dice_threshold is None else settings.player_dice_threshold
+    if settings.player_dice_threshold is None:
+        threshold = "关闭"
+    elif settings.player_dice_threshold <= Decimal("0.01"):
+        threshold = "默认开启（本期投注最高者）"
+    else:
+        threshold = settings.player_dice_threshold
     text = (
         f"<b>💰 {escape(group.title)} · 底注与玩家掷骰</b>\n\n"
         f"最低下注：<b>{settings.minimum_bet}</b>\n"
         f"玩家掷骰门槛：<b>{threshold}</b>\n\n"
-        "门槛按本期累计有效投注额判断。多人达标时，投注最高者优先。"
+        "默认由本期累计有效投注最高者掷骰；金额相同则先达到者优先。"
+        "无人下注时机器人直接掷骰，不等待玩家。"
     )
     rows = [
         [_button("✏️ 修改最低下注", f"a:i:{group_id}:min")],
@@ -533,7 +741,7 @@ async def _data_view(session_factory, group_id: int) -> tuple[str, InlineKeyboar
     )
     text = (
         f"<b>📈 {escape(group.title)} · 走势与数据</b>\n\n"
-        f"走势图滚动显示最近 <b>{visible_history}</b> 期，期号持续累计，不会从头铺到当前期。"
+        f"走势图横屏滚动显示最近 <b>{visible_history}</b> 期，每行14期且不显示格内期号。"
         f"{legacy_note}\n报表按当前群独立统计。"
     )
     markup = InlineKeyboardMarkup(
@@ -989,10 +1197,73 @@ async def admin_callback(
         await _show(query, *(await _home_view(session_factory)))
     elif action == "o":
         await _show(query, *(await _overview_view(session_factory)))
+    elif action == "mq":
+        await _show(query, *(await _message_queue_view(session_factory, int(parts[2]))))
+    elif action == "mr":
+        count = await _retry_failed_messages(
+            session_factory, admin_id, int(parts[2])
+        )
+        await query.message.answer("已重新加入发送队列。" if count else "该消息已处理。")
+        await _show(
+            query,
+            *(await _message_queue_view(session_factory, int(parts[3]))),
+        )
+    elif action == "ma":
+        count = await _retry_failed_messages(session_factory, admin_id)
+        await query.message.answer(f"已将 {count} 条消息重新加入发送队列。")
+        await _show(query, *(await _message_queue_view(session_factory, 0)))
     elif action == "gl":
         await _show(query, *(await _groups_view(session_factory, int(parts[2]), parts[3])))
     elif action == "g":
         await _show(query, *(await _group_view(session_factory, int(parts[2]))))
+    elif action == "mv":
+        await _show(query, *(await _message_buttons_view(session_factory, int(parts[2]))))
+    elif action == "mt":
+        await _show(
+            query,
+            *(await _message_button_template_view(
+                session_factory, int(parts[2]), parts[3]
+            )),
+        )
+    elif action == "mb":
+        group_id, code = int(parts[2]), parts[3]
+        await state.set_state(AdminInput.message_button)
+        await state.set_data({"group_id": group_id, "template_code": code})
+        await query.message.answer(
+            "请分两行发送按钮资料：\n\n"
+            "<code>充值提现\nhttps://example.com/recharge</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [_button("取消并返回", f"a:mt:{group_id}:{code}")]
+                ]
+            ),
+        )
+    elif action == "md":
+        group_id, code, index = int(parts[2]), parts[3], int(parts[4])
+        key, _ = MESSAGE_BUTTON_TEMPLATES[code]
+        async with session_factory() as session, session.begin():
+            settings = await session.get(GameSettings, group_id, with_for_update=True)
+            if settings:
+                configured = dict(settings.message_buttons or {})
+                buttons = list(configured.get(key, []))
+                if 0 <= index < len(buttons):
+                    removed = buttons.pop(index)
+                    configured[key] = buttons
+                    settings.message_buttons = configured
+                    settings.version += 1
+                    await _audit(
+                        session,
+                        admin_id,
+                        "message_button_deleted",
+                        group_id,
+                        template=key,
+                        text=removed.get("text"),
+                    )
+        await _show(
+            query,
+            *(await _message_button_template_view(session_factory, group_id, code)),
+        )
     elif action == "p":
         group_id = int(parts[2])
         async with session_factory() as session, session.begin():
@@ -1284,7 +1555,11 @@ async def admin_callback(
                     group_id=group_id,
                     sequence=0,
                     message_type="text",
-                    payload={"text": rules_text(odds, settings.minimum_bet), "pin": True},
+                    payload={
+                        "text": rules_text(odds, settings.minimum_bet),
+                        "pin": True,
+                        "button_template": "rules",
+                    },
                     idempotency_key=f"admin-rules:{group_id}:{uuid.uuid4().hex}",
                 )
             )
@@ -1329,6 +1604,51 @@ async def admin_callback(
                 inline_keyboard=[[_button("取消并返回", return_to)]]
             ),
         )
+
+
+@router.message(AdminInput.message_button, F.chat.type == ChatType.PRIVATE)
+async def admin_message_button_input(
+    message: Message, session_factory, state: FSMContext
+) -> None:
+    if not is_super_admin(message.from_user.id if message.from_user else None):
+        return
+    values = await state.get_data()
+    group_id = int(values["group_id"])
+    code = str(values["template_code"])
+    key, _ = MESSAGE_BUTTON_TEMPLATES[code]
+    try:
+        label, url = parse_message_button_input(message.text or "")
+        async with session_factory() as session, session.begin():
+            settings = await session.get(GameSettings, group_id, with_for_update=True)
+            if settings is None:
+                raise ValueError("群设置不存在")
+            configured = dict(settings.message_buttons or {})
+            buttons = list(configured.get(key, []))
+            if len(buttons) >= 8:
+                raise ValueError("该消息已经配置了8个按钮")
+            buttons.append({"text": label, "url": url})
+            configured[key] = buttons
+            settings.message_buttons = configured
+            settings.version += 1
+            await _audit(
+                session,
+                message.from_user.id,
+                "message_button_added",
+                group_id,
+                template=key,
+                text=label,
+                url=url,
+            )
+    except ValueError as exc:
+        await message.answer(f"输入有误：{escape(str(exc))}。请重新输入。")
+        return
+    await state.clear()
+    text, markup = await _message_button_template_view(session_factory, group_id, code)
+    await message.answer(
+        f"✅ 按钮已保存。\n\n{text}",
+        reply_markup=markup,
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @router.message(AdminInput.setting_value, F.chat.type == ChatType.PRIVATE)

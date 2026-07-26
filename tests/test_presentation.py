@@ -20,6 +20,7 @@ from botwanfa.presentation import (
     render_trend_image,
     result_caption,
     round_code,
+    round_reference,
     rules_text,
     settlement_text,
     success_bet_text,
@@ -65,6 +66,22 @@ def test_round_codes_remain_unambiguous_after_ten_thousand_rounds() -> None:
     assert round_code(8) == "000008"
     assert round_code(10_000) == "010000"
     assert round_code(1_000_000) == "1000000"
+
+
+def test_public_round_references_are_stable_32_character_codes() -> None:
+    reference = round_reference(-100123456, 10_000)
+    assert re.fullmatch(r"[0-9a-f]{32}", reference)
+    assert reference == round_reference(-100123456, 10_000)
+    assert reference != round_reference(-100123456, 10_001)
+    assert reference != round_reference(-100654321, 10_000)
+    opened = open_caption(
+        round_number=10_000,
+        betting_seconds=30,
+        minimum_bet=Decimal(1),
+        reference=reference,
+    )
+    assert f"<code>{reference}</code>" in opened
+    assert "010000" not in opened
 
 
 def test_result_mentions_stay_in_one_caption_for_small_and_large_groups() -> None:
@@ -145,7 +162,7 @@ def test_status_and_trend_images_are_valid_png_files() -> None:
                 is_triple=outcome.is_triple,
             )
         )
-    assert image_size(render_trend_image(points, 10000)) == (1080, 2393)
+    assert image_size(render_trend_image(points, 10000)) == (1680, 1169)
 
 
 def test_trend_image_never_grows_beyond_the_rolling_window() -> None:
@@ -164,7 +181,7 @@ def test_trend_image_never_grows_beyond_the_rolling_window() -> None:
                 is_triple=outcome.is_triple,
             )
         )
-    assert image_size(render_trend_image(points, 10000)) == (1080, 2393)
+    assert image_size(render_trend_image(points, 10000)) == (1680, 1169)
 
 
 def test_round_result_combines_trend_and_every_player_settlement_in_one_image() -> None:
@@ -195,7 +212,7 @@ def test_round_result_combines_trend_and_every_player_settlement_in_one_image() 
         for index in range(3)
     ]
     image = render_round_result_image(points, 10000, settlements)
-    assert image_size(image) == (1500, 2802)
+    assert image_size(image) == (1680, 1578)
 
 
 def test_long_bet_and_settlement_lists_are_paginated_without_omission() -> None:

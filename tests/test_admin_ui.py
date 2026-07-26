@@ -4,7 +4,9 @@ from botwanfa.apps.admin import (
     _odds_items_markup,
     _odds_menu_markup,
     admin_menu_markup,
+    parse_message_button_input,
 )
+from botwanfa.apps.sender import template_message_markup
 from botwanfa.db.models import OddsSetting
 
 
@@ -132,3 +134,22 @@ def test_odds_callbacks_fit_telegram_limit() -> None:
         )
     )
     assert all(len(value.encode()) <= 64 for markup in markups for value in callbacks(markup))
+
+
+def test_message_button_input_and_two_column_markup() -> None:
+    label, url = parse_message_button_input("充值提现\nhttps://example.com/recharge")
+    assert label == "充值提现"
+    assert url == "https://example.com/recharge"
+    markup = template_message_markup(
+        {
+            "round_open": [
+                {"text": "充值", "url": "https://example.com/1"},
+                {"text": "客服", "url": "https://example.com/2"},
+                {"text": "频道", "url": "https://example.com/3"},
+            ]
+        },
+        "round_open",
+    )
+    assert markup is not None
+    assert [len(row) for row in markup.inline_keyboard] == [2, 1]
+    assert markup.inline_keyboard[0][0].url == "https://example.com/1"
