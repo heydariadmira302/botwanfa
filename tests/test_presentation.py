@@ -1,4 +1,6 @@
+import re
 from decimal import Decimal
+from html import unescape
 from io import BytesIO
 
 from PIL import Image
@@ -8,15 +10,15 @@ from botwanfa.presentation import (
     BetSummary,
     SettlementSummary,
     TrendPoint,
+    caption_with_player_mentions,
     closed_bet_text,
     load_status_animation,
     open_caption,
-    player_mention_chunks,
     render_bet_summary_pages,
+    render_round_result_image,
     render_settlement_pages,
     render_trend_image,
     result_caption,
-    result_notification_parts,
     round_code,
     rules_text,
     settlement_text,
@@ -46,7 +48,8 @@ def test_open_and_success_templates_include_required_details() -> None:
         balance=Decimal(880),
     )
     assert "&lt;测试 &amp; 玩家&gt;" in accepted
-    assert "ID: <code>123</code>" in accepted
+    assert "tg://user?id=123" in accepted
+    assert "ID:" not in accepted
     assert "大 100.00、和值10 20.00" in accepted
 
 
@@ -64,31 +67,18 @@ def test_round_codes_remain_unambiguous_after_ten_thousand_rounds() -> None:
     assert round_code(1_000_000) == "1000000"
 
 
-def test_player_mentions_are_complete_and_split_below_message_limit() -> None:
-    players = [(1000 + index, f"很长的玩家昵称<{index}>&测试") for index in range(45)]
-    chunks = player_mention_chunks(players, max_length=700)
-    combined = "".join(chunks)
-    assert len(chunks) > 1
-    assert all(len(chunk) <= 700 for chunk in chunks)
-    assert all(f"tg://user?id={user_id}" in combined for user_id, _ in players)
-    assert "&lt;" in combined
-    assert "&amp;" in combined
-
-
-def test_result_mentions_stay_in_caption_for_small_groups_and_split_for_large_groups() -> None:
+def test_result_mentions_stay_in_one_caption_for_small_and_large_groups() -> None:
     base = result_caption(10_000, evaluate_dice((3, 4, 5)), "bot")
-    caption, messages = result_notification_parts(base, [(1, "玩家甲"), (2, "玩家乙")])
-    assert messages == []
+    caption = caption_with_player_mentions(base, [(1, "玩家甲"), (2, "玩家乙")])
     assert "tg://user?id=1" in caption
-    assert len(caption) <= 1000
+    assert "玩家甲" in caption
 
     players = [(1000 + index, f"玩家{index}") for index in range(120)]
-    caption, messages = result_notification_parts(base, players)
-    combined = "".join(messages)
-    assert caption == base
-    assert len(messages) >= 2
-    assert all(len(message) <= 3500 for message in messages)
-    assert all(f"tg://user?id={user_id}" in combined for user_id, _ in players)
+    caption = caption_with_player_mentions(base, players)
+    visible_caption = unescape(re.sub(r"<[^>]+>", "", caption))
+    assert all(f"tg://user?id={user_id}" in caption for user_id, _ in players)
+    assert caption.count("•") == len(players)
+    assert len(visible_caption) <= 1024
 
 
 def test_normal_close_message_keeps_player_bets_in_text() -> None:
@@ -109,8 +99,10 @@ def test_normal_close_message_keeps_player_bets_in_text() -> None:
     )
     assert "本期下注玩家：1 人" in text
     assert "玩家甲" in text
+    assert "tg://user?id=123" in text
+    assert "ID:" not in text
     assert "投注：大 100.00、和值10 50.00" in text
-    assert "机器人将在 10 秒后掷骰子" in text
+    assert "将在 10 秒后进入掷骰流程" in text
 
 
 def test_rules_template_uses_current_group_odds() -> None:
@@ -175,6 +167,37 @@ def test_trend_image_never_grows_beyond_the_rolling_window() -> None:
     assert image_size(render_trend_image(points, 10000)) == (1080, 2393)
 
 
+def test_round_result_combines_trend_and_every_player_settlement_in_one_image() -> None:
+    points = []
+    for number in range(9917, 10001):
+        dice = (number % 6 + 1, (number + 1) % 6 + 1, (number + 2) % 6 + 1)
+        outcome = evaluate_dice(dice)
+        points.append(
+            TrendPoint(
+                round_number=number,
+                dice=dice,
+                total=outcome.total,
+                is_big=outcome.is_big,
+                is_odd=outcome.is_odd,
+                is_straight=outcome.is_straight,
+                is_triple=outcome.is_triple,
+            )
+        )
+    settlements = [
+        SettlementSummary(
+            user_id=1000 + index,
+            display_name=f"测试玩家{index}",
+            wagered=Decimal(100),
+            returned=Decimal(200),
+            net=Decimal(100),
+            balance=Decimal(1100),
+        )
+        for index in range(3)
+    ]
+    image = render_round_result_image(points, 10000, settlements)
+    assert image_size(image) == (1500, 2802)
+
+
 def test_long_bet_and_settlement_lists_are_paginated_without_omission() -> None:
     bets = [
         BetSummary(
@@ -201,7 +224,8 @@ def test_long_bet_and_settlement_lists_are_paginated_without_omission() -> None:
         for index in range(60)
     ]
     text = settlement_text(99, settlements)
-    assert all(str(1000 + index) in text for index in range(60))
+    assert all(f"tg://user?id={1000 + index}" in text for index in range(60))
+    assert "ID:" not in text
     settlement_pages = render_settlement_pages(99, settlements)
     assert len(settlement_pages) == 3
     assert all(image_size(page)[0] == 1500 for page in settlement_pages)

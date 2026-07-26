@@ -143,19 +143,9 @@ class SettlementService:
             OutboxMessage(
                 group_id=round_.group_id,
                 sequence=40,
-                message_type="trend_result",
+                message_type="round_result",
                 payload={"round_id": round_id, "round_number": round_.round_number},
-                idempotency_key=f"round:{round_id}:trend-result",
-                available_at=available_at,
-            )
-        )
-        session.add(
-            OutboxMessage(
-                group_id=round_.group_id,
-                sequence=50,
-                message_type="settlement_summary",
-                payload={"round_id": round_id, "round_number": round_.round_number},
-                idempotency_key=f"round:{round_id}:settlement-summary",
+                idempotency_key=f"round:{round_id}:result",
                 available_at=available_at,
             )
         )

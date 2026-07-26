@@ -40,17 +40,14 @@ from botwanfa.presentation import (
     SettlementSummary,
     TrendPoint,
     bet_item_text,
+    caption_with_player_mentions,
     closed_bet_text,
     closed_caption,
     load_status_animation,
     open_caption,
     render_bet_summary_pages,
-    render_settlement_pages,
-    render_trend_image,
+    render_round_result_image,
     result_caption,
-    result_notification_parts,
-    round_code,
-    settlement_text,
 )
 
 log = structlog.get_logger()
@@ -92,12 +89,16 @@ async def mark_retry(session_factory, message_id: int, delay: int, error: str) -
             row.last_error = error[:2000]
 
 
-async def mark_sent(session_factory, message_id: int) -> None:
+async def mark_sent(
+    session_factory, message_id: int, *, combined_result_sent: bool = False
+) -> None:
     async with session_factory() as session, session.begin():
         row = await session.get(OutboxMessage, message_id, with_for_update=True)
         if row:
             row.status = "sent"
             row.sent_at = datetime.now(UTC)
+            if combined_result_sent:
+                row.payload = {**row.payload, "combined_result_sent": True}
 
 
 async def mark_failed(session_factory, message_id: int, error: str) -> None:
@@ -110,6 +111,16 @@ async def mark_failed(session_factory, message_id: int, error: str) -> None:
                 round_ = await session.get(Round, int(row.payload["round_id"]))
                 if round_:
                     round_.status = RoundStatus.MANUAL_REVIEW.value
+
+
+async def legacy_result_was_combined(session_factory, round_id: int) -> bool:
+    async with session_factory() as session:
+        row = await session.scalar(
+            select(OutboxMessage).where(
+                OutboxMessage.idempotency_key == f"round:{round_id}:trend-result"
+            )
+        )
+    return bool(row and row.payload.get("combined_result_sent"))
 
 
 async def send_photo_pages(
@@ -244,11 +255,15 @@ async def send_round_closed(
         await bot.send_message(group_id, full_text)
         return
     summary_pages = await asyncio.to_thread(render_bet_summary_pages, round_number, summaries)
+    summary_caption = caption_with_player_mentions(
+        "<b>本期下注清单</b>",
+        [(row.user_id, row.display_name) for row in summaries],
+    )
     await send_photo_pages(
         bot,
         group_id,
         summary_pages,
-        caption="<b>本期下注清单</b>",
+        caption=summary_caption,
         filename_prefix=f"round-{round_number}-closed",
     )
 
@@ -265,7 +280,7 @@ async def send_player_dice_invite(
     await bot.send_message(
         group_id,
         f"🎲 <a href=\"tg://user?id={user_id}\">{escape(display_name)}</a>"
-        f"（ID: <code>{user_id}</code>）已达到本期掷骰门槛。\n"
+        " 已达到本期掷骰门槛。\n"
         f"请在 <b>{seconds} 秒</b>内连续发送三颗 Telegram 原生骰子。",
     )
     async with session_factory() as session, session.begin():
@@ -279,7 +294,7 @@ async def send_player_dice_invite(
             }
 
 
-async def send_trend_result(
+async def send_round_result(
     bot: Bot, session_factory, group_id: int, payload: dict
 ) -> None:
     round_id = int(payload["round_id"])
@@ -335,19 +350,28 @@ async def send_trend_result(
     current_outcome = evaluate_dice(
         (current_dice.die_1, current_dice.die_2, current_dice.die_3)
     )
-    image = await asyncio.to_thread(render_trend_image, points, round_number)
+    settlements = await load_settlement_summaries(session_factory, round_id)
+    image = await asyncio.to_thread(
+        render_round_result_image, points, round_number, settlements
+    )
     caption = result_caption(round_number, current_outcome, current_dice.source)
-    caption, mention_messages = result_notification_parts(
+    caption = caption_with_player_mentions(
         caption,
         [(user_id, display_name) for user_id, display_name in participants],
     )
-    await bot.send_photo(
-        group_id,
-        BufferedInputFile(image, filename=f"round-{round_number}-trend.png"),
-        caption=caption,
-    )
-    for mention_text in mention_messages:
-        await bot.send_message(group_id, mention_text)
+    filename = f"round-{round_number}-result.png"
+    if len(settlements) <= 100:
+        await bot.send_photo(
+            group_id,
+            BufferedInputFile(image, filename=filename),
+            caption=caption,
+        )
+    else:
+        await bot.send_document(
+            group_id,
+            BufferedInputFile(image, filename=filename),
+            caption=caption,
+        )
 
 
 async def load_settlement_summaries(
@@ -379,26 +403,6 @@ async def load_settlement_summaries(
         )
         for settlement, user, reward in rows
     ]
-
-
-async def send_settlement_summary(
-    bot: Bot, session_factory, group_id: int, payload: dict
-) -> None:
-    round_id = int(payload["round_id"])
-    round_number = int(payload["round_number"])
-    rows = await load_settlement_summaries(session_factory, round_id)
-    text = settlement_text(round_number, rows)
-    if len(text) <= 3900:
-        await bot.send_message(group_id, text)
-        return
-    pages = await asyncio.to_thread(render_settlement_pages, round_number, rows)
-    await send_photo_pages(
-        bot,
-        group_id,
-        pages,
-        caption=f"<b>第 <code>{round_code(round_number)}</code> 期 · 全部玩家结算</b>",
-        filename_prefix=f"round-{round_number}-settlement",
-    )
 
 
 async def send_dice_round(
@@ -497,6 +501,7 @@ async def run() -> None:
                 await asyncio.sleep(settings.sender_poll_seconds)
                 continue
             message_id, group_id, message_type, payload = item
+            combined_result_sent = False
             try:
                 if message_type == "text":
                     sent = await bot.send_message(group_id, payload["text"])
@@ -515,10 +520,20 @@ async def run() -> None:
                     await send_player_dice_invite(bot, factory, group_id, payload)
                 elif message_type == "dice_round":
                     await send_dice_round(bot, factory, message_id, group_id, payload)
-                elif message_type == "trend_result":
-                    await send_trend_result(bot, factory, group_id, payload)
+                elif message_type in {"round_result", "trend_result"}:
+                    await send_round_result(bot, factory, group_id, payload)
+                    combined_result_sent = True
                 elif message_type == "settlement_summary":
-                    await send_settlement_summary(bot, factory, group_id, payload)
+                    round_id = int(payload["round_id"])
+                    if await legacy_result_was_combined(factory, round_id):
+                        log.info(
+                            "legacy_settlement_message_skipped",
+                            outbox_message_id=message_id,
+                            group_id=group_id,
+                        )
+                    else:
+                        await send_round_result(bot, factory, group_id, payload)
+                        combined_result_sent = True
                 else:
                     raise ValueError(f"unknown outbox message type: {message_type}")
             except TelegramRetryAfter as exc:
@@ -529,7 +544,11 @@ async def run() -> None:
                 await mark_failed(factory, message_id, str(exc))
                 log.exception("send_failed", outbox_message_id=message_id)
             else:
-                await mark_sent(factory, message_id)
+                await mark_sent(
+                    factory,
+                    message_id,
+                    combined_result_sent=combined_result_sent,
+                )
     finally:
         await bot.session.close()
         await engine.dispose()

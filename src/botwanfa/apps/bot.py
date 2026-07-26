@@ -1,8 +1,10 @@
 import asyncio
+import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from html import escape
 
+import structlog
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType, ParseMode
 from aiogram.filters import Command
@@ -28,27 +30,27 @@ from botwanfa.db.session import create_engine_and_session
 from botwanfa.domain.bets import BetParseError, parse_bets
 from botwanfa.domain.state_machine import RoundStatus
 from botwanfa.logging import configure_logging
-from botwanfa.presentation import bet_item_text, rules_text, success_bet_text
+from botwanfa.presentation import bet_item_text, player_mention, rules_text, success_bet_text
 from botwanfa.services.betting import BettingError, BettingService
 from botwanfa.services.provisioning import provision_participant
 
 router = Router()
 betting = BettingService()
+log = structlog.get_logger()
 __all__ = ["admin_menu_markup"]
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
-BET_TOKENS = (
-    "\u5927",
-    "\u5c0f",
-    "\u5355",
-    "\u53cc",
-    "dd",
-    "ds",
-    "xd",
-    "xs",
-    "\u548c\u503c",
-    "\u987a\u5b50",
-    "\u8c79\u5b50",
+BET_INTENT = re.compile(
+    r"(?:^|[\s,，、;；])(?:"
+    r"和值\s*\d|"
+    r"(?:大|小|单|双|dd|ds|xd|xs|顺子|豹子)\s*\d|"
+    r"(?:111|222|333|444|555|666)\s+\d"
+    r")",
+    re.IGNORECASE,
 )
+
+
+def looks_like_bet(text: str) -> bool:
+    return bool(BET_INTENT.search(text.strip()))
 
 
 async def ensure_participant(message: Message, session_factory) -> None:
@@ -90,9 +92,8 @@ async def balance(message: Message, session_factory) -> None:
                 Wallet.user_id == user.id,
             )
         )
-    mention = f'<a href="tg://user?id={user.id}">{escape(user.full_name)}</a>'
     await message.reply(
-        f"💰 {mention}（ID: <code>{user.id}</code>）\n"
+        f"💰 {player_mention(user.id, user.full_name)}\n"
         f"当前余额：<b>{wallet.balance if wallet else 0.00}</b>",
         parse_mode=ParseMode.HTML,
     )
@@ -131,10 +132,10 @@ async def checkin_command(message: Message, session_factory) -> None:
 
 
 def failure_message(user, *, item: str = "", reason: str) -> str:
-    mention = f"<a href=tg://user?id={user.id}>{escape(user.full_name)}</a>"
+    mention = player_mention(user.id, user.full_name)
     item_line = f"\u9519\u8bef\u9879\u76ee\uff1a{escape(item)}\n" if item else ""
     return (
-        f"\u274c {mention}\uff08ID: {user.id}\uff09\u672c\u6761\u6295\u6ce8\u672a\u53d7\u7406\n"
+        f"\u274c {mention} \u672c\u6761\u6295\u6ce8\u672a\u53d7\u7406\n"
         f"{item_line}\u539f\u56e0\uff1a{escape(reason)}\n"
         "\u672c\u6761\u6d88\u606f\u4e2d\u7684\u6295\u6ce8\u5747\u672a\u6263\u5206\u3002"
     )
@@ -226,7 +227,7 @@ async def send_group_ranking(message: Message, session_factory, period: str) -> 
         ).all()
     title = {"day": "日榜", "week": "周榜", "month": "月榜"}[period]
     lines = [
-        f"{index}. {escape(name)}（ID: {user_id}） · 流水 {turnover}"
+        f"{index}. {player_mention(user_id, name)} · 流水 {turnover}"
         for index, (user_id, name, turnover) in enumerate(rows, 1)
     ]
     text = f"<b>🏆 {title}</b>\n\n" + ("\n".join(lines) if lines else "当前周期暂无有效投注。")
@@ -296,6 +297,42 @@ async def collect_player_dice(message: Message, session_factory) -> None:
             round_.status = RoundStatus.SETTLING.value
 
 
+def betting_unavailable_reason(round_: Round | None, now: datetime) -> str | None:
+    if round_ is None:
+        return "当前尚未开盘，请等待下一期开始下注"
+    if (
+        round_.status == RoundStatus.BETTING.value
+        and (round_.betting_closes_at is None or now < round_.betting_closes_at)
+    ):
+        return None
+    if round_.status == RoundStatus.BETTING.value:
+        return "本期已停止下注，请等待下一期开盘"
+    if round_.status == RoundStatus.PAUSED.value:
+        return "本群游戏已暂停，暂不受理下注"
+    if round_.status in {
+        RoundStatus.CLOSED.value,
+        RoundStatus.WAITING_FOR_PLAYER_DICE.value,
+        RoundStatus.BOT_ROLLING.value,
+        RoundStatus.SETTLING.value,
+        RoundStatus.COMPLETED.value,
+    }:
+        return "本期已停止下注，请等待下一期开盘"
+    return "当前期次暂不受理下注，请稍后再试"
+
+
+async def current_betting_unavailable_reason(
+    session_factory, group_id: int
+) -> str | None:
+    async with session_factory() as session:
+        latest_round = await session.scalar(
+            select(Round)
+            .where(Round.group_id == group_id)
+            .order_by(Round.round_number.desc())
+            .limit(1)
+        )
+    return betting_unavailable_reason(latest_round, datetime.now(UTC))
+
+
 @router.message(F.chat.type.in_(GROUP_TYPES), F.text)
 async def group_text(message: Message, session_factory) -> None:
     text = message.text or ""
@@ -313,20 +350,46 @@ async def group_text(message: Message, session_factory) -> None:
     if ranking_period:
         await send_group_ranking(message, session_factory, ranking_period)
         return
+    user = message.from_user
+    bet_intent = looks_like_bet(text)
+    participant_ready = False
+    if user and bet_intent:
+        await ensure_participant(message, session_factory)
+        participant_ready = True
+        unavailable_reason = await current_betting_unavailable_reason(
+            session_factory, message.chat.id
+        )
+        if unavailable_reason:
+            await message.reply(
+                failure_message(user, reason=unavailable_reason),
+                parse_mode=ParseMode.HTML,
+            )
+            return
     try:
         items = parse_bets(text)
     except BetParseError as exc:
-        user = message.from_user
-        if user and any(token in text.lower() for token in BET_TOKENS):
+        if user and bet_intent:
             await message.reply(
                 failure_message(user, item=exc.item, reason=exc.reason),
                 parse_mode=ParseMode.HTML,
             )
         return
-    user = message.from_user
     if user is None:
         return
-    await ensure_participant(message, session_factory)
+    if not bet_intent:
+        await ensure_participant(message, session_factory)
+        participant_ready = True
+        unavailable_reason = await current_betting_unavailable_reason(
+            session_factory, message.chat.id
+        )
+        if unavailable_reason:
+            await message.reply(
+                failure_message(user, reason=unavailable_reason),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+    if not participant_ready:
+        await ensure_participant(message, session_factory)
     try:
         async with session_factory() as session, session.begin():
             result = await betting.place_batch(
@@ -340,6 +403,18 @@ async def group_text(message: Message, session_factory) -> None:
     except BettingError as exc:
         await message.reply(
             failure_message(user, reason=str(exc)),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except Exception:
+        log.exception(
+            "bet_submission_failed",
+            group_id=message.chat.id,
+            user_id=user.id,
+            telegram_message_id=message.message_id,
+        )
+        await message.reply(
+            failure_message(user, reason="系统暂时未完成受理，请重新发送本条下注"),
             parse_mode=ParseMode.HTML,
         )
         return

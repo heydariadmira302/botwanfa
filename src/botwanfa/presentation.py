@@ -101,45 +101,27 @@ def round_code(round_number: int) -> str:
     return str(round_number).zfill(6)
 
 
-def player_mention(user_id: int, display_name: str) -> str:
+def player_mention(user_id: int, display_name: str, *, max_label: int = 16) -> str:
     label = display_name.strip() or f"玩家 {user_id}"
-    if len(label) > 16:
-        label = label[:15] + "…"
+    if len(label) > max_label:
+        label = label[: max_label - 1] + "…"
     return f'<a href="tg://user?id={user_id}">{escape(label)}</a>'
 
 
-def player_mention_chunks(
-    players: Sequence[tuple[int, str]], *, max_length: int = 900
-) -> list[str]:
-    prefix = "<b>🔔 本期下注玩家</b>\n"
-    if max_length <= len(prefix) + 50:
-        raise ValueError("mention chunk limit is too small")
-    chunks: list[str] = []
-    current = prefix
-    for user_id, display_name in players:
-        mention = player_mention(user_id, display_name)
-        separator = "" if current == prefix else "、"
-        if current != prefix and len(current) + len(separator) + len(mention) > max_length:
-            chunks.append(current)
-            current = prefix + mention
-        else:
-            current += separator + mention
-    if current != prefix:
-        chunks.append(current)
-    return chunks
-
-
-def result_notification_parts(
-    caption: str,
-    players: Sequence[tuple[int, str]],
-    *,
-    caption_limit: int = 1000,
-    message_limit: int = 3500,
-) -> tuple[str, list[str]]:
-    mention_messages = player_mention_chunks(players, max_length=message_limit)
-    if len(mention_messages) == 1 and len(caption) + len(mention_messages[0]) + 2 <= caption_limit:
-        return f"{caption}\n\n{mention_messages[0]}", []
-    return caption, mention_messages
+def caption_with_player_mentions(
+    caption: str, players: Sequence[tuple[int, str]]
+) -> str:
+    if not players:
+        return caption
+    if len(players) <= 20:
+        mentions = "、".join(player_mention(user_id, name) for user_id, name in players)
+    else:
+        # Names and settlement details remain visible in the image. Compact links keep
+        # every bettor mentioned while the single photo caption stays under 1024 chars.
+        mentions = "".join(
+            f'<a href="tg://user?id={user_id}">•</a>' for user_id, _ in players
+        )
+    return f"{caption}\n\n<b>🔔 本期下注玩家</b>\n{mentions}"
 
 
 def bet_label(bet_type: str, bet_value: str = "") -> str:
@@ -155,8 +137,7 @@ def success_bet_text(
     *, display_name: str, user_id: int, items: Iterable[str], total: Decimal, balance: Decimal
 ) -> str:
     return (
-        f"✅ <a href=\"tg://user?id={user_id}\">{escape(display_name)}</a>"
-        f"（ID: <code>{user_id}</code>）投注已受理\n"
+        f"✅ {player_mention(user_id, display_name)} 投注已受理\n"
         f"投注：{escape('、'.join(items))}\n"
         f"合计扣分：<b>{money(total)}</b>　余额：<b>{money(balance)}</b>"
     )
@@ -203,18 +184,18 @@ def closed_bet_text(
         f"本期总流水：<b>{money(turnover)}</b>",
     ]
     if not rows:
-        lines.extend(("", f"无人下注，机器人将在 {rolling_seconds} 秒后掷骰子。"))
+        lines.extend(("", f"无人下注，将在 {rolling_seconds} 秒后进入开奖流程。"))
         return "\n".join(lines)
     for index, row in enumerate(rows, 1):
         lines.extend(
             (
                 "",
-                f"{index}. {escape(row.display_name)}（ID: <code>{row.user_id}</code>）",
+                f"{index}. {player_mention(row.user_id, row.display_name)}",
                 f"投注：{escape('、'.join(row.items))}",
                 f"小计：<b>{money(row.total)}</b>",
             )
         )
-    lines.extend(("", f"机器人将在 {rolling_seconds} 秒后掷骰子。"))
+    lines.extend(("", f"将在 {rolling_seconds} 秒后进入掷骰流程。"))
     return "\n".join(lines)
 
 
@@ -226,7 +207,7 @@ def result_caption(round_number: int, outcome: DiceOutcome, source: str) -> str:
     if outcome.is_triple:
         labels.extend(("豹子", f"指定豹子{outcome.triple_value}"))
     source_text = (
-        f"玩家 {source.split(':', 1)[1]} 掷骰"
+        "本期达标玩家掷骰"
         if source.startswith("player:")
         else "机器人掷骰"
     )
@@ -261,7 +242,7 @@ def settlement_text(round_number: int, rows: Sequence[SettlementSummary]) -> str
         lines.extend(
             (
                 "",
-                f"{index}. {state} {escape(row.display_name)}（ID: <code>{row.user_id}</code>）",
+                f"{index}. {state} {player_mention(row.user_id, row.display_name)}",
                 (
                     f"投注 {money(row.wagered)}　返还 {money(row.returned)}　"
                     f"净输赢 <b>{sign}{money(row.net)}</b>{reward}"
@@ -438,7 +419,7 @@ def render_bet_summary_pages(
             name = row.display_name[:28]
             draw.text(
                 (60, y + 16),
-                f"{absolute_index:02d}  {name}  ·  ID {row.user_id}",
+                f"{absolute_index:02d}  {name}",
                 font=_font(28, True),
                 fill=WHITE,
             )
@@ -486,7 +467,7 @@ def render_settlement_pages(
             draw.rectangle((35, y, width - 35, y + 66), fill=fill)
             draw.text(
                 (55, y + 15),
-                f"{absolute_index:02d}  {row.display_name[:20]}  ·  {row.user_id}",
+                f"{absolute_index:02d}  {row.display_name[:20]}",
                 font=_font(24, True),
                 fill=WHITE,
             )
@@ -580,4 +561,90 @@ def render_trend_image(points: Sequence[TrendPoint], current_round: int) -> byte
         font=_font(20),
         fill=MUTED,
     )
+    return _png(image)
+
+
+def render_round_result_image(
+    points: Sequence[TrendPoint],
+    current_round: int,
+    rows: Sequence[SettlementSummary],
+) -> bytes:
+    trend = Image.open(io.BytesIO(render_trend_image(points, current_round))).convert("RGB")
+    width = 1500
+    section_y = trend.height + 20
+    summary_height = 125
+    headings_y = section_y + summary_height + 18
+    rows_y = headings_y + 42
+    row_height = 58
+    data_height = max(75, len(rows) * row_height)
+    height = rows_y + data_height + 30
+    image = Image.new("RGB", (width, height), CANVAS)
+    image.paste(trend, ((width - trend.width) // 2, 0))
+    draw = ImageDraw.Draw(image)
+
+    total_wagered = sum((row.wagered for row in rows), Decimal("0.00"))
+    total_returned = sum((row.returned for row in rows), Decimal("0.00"))
+    total_net = total_returned - total_wagered
+    net_sign = "+" if total_net > 0 else ""
+    draw.rectangle((0, section_y, width, section_y + summary_height), fill=PANEL)
+    draw.rectangle((0, section_y, 16, section_y + summary_height), fill=GOLD)
+    draw.text((55, section_y + 22), "本期全员结算", font=_font(42, True), fill=WHITE)
+    draw.text(
+        (58, section_y + 78),
+        (
+            f"参与 {len(rows)} 人  ·  投注 {money(total_wagered)}  ·  "
+            f"返还 {money(total_returned)}  ·  玩家净输赢 {net_sign}{money(total_net)}"
+        ),
+        font=_font(23),
+        fill=MUTED,
+    )
+    headings = (
+        (55, "玩家"),
+        (650, "投注"),
+        (850, "返还"),
+        (1050, "净输赢"),
+        (1280, "最终余额"),
+    )
+    for x, heading in headings:
+        draw.text((x, headings_y), heading, font=_font(22, True), fill=MUTED)
+    if not rows:
+        draw.text(
+            (width // 2, rows_y + 20),
+            "本期无人投注",
+            font=_font(34, True),
+            fill=MUTED,
+            anchor="ma",
+        )
+        return _png(image)
+
+    for index, row in enumerate(rows):
+        y = rows_y + index * row_height
+        fill = PANEL if index % 2 == 0 else PANEL_ALT
+        draw.rectangle((35, y, width - 35, y + row_height - 5), fill=fill)
+        state_color = GREEN if row.net > 0 else (RED if row.net < 0 else MUTED)
+        draw.ellipse((55, y + 18, 71, y + 34), fill=state_color)
+        draw.text(
+            (85, y + 12),
+            f"{index + 1:02d}  {row.display_name[:24]}",
+            font=_font(22, True),
+            fill=WHITE,
+        )
+        draw.text((650, y + 12), money(row.wagered), font=_font(21), fill=WHITE)
+        draw.text((850, y + 12), money(row.returned), font=_font(21), fill=WHITE)
+        sign = "+" if row.net > 0 else ""
+        reward = (
+            f"  奖+{money(row.streak_reward)}" if row.streak_reward > 0 else ""
+        )
+        draw.text(
+            (1050, y + 12),
+            f"{sign}{money(row.net)}{reward}",
+            font=_font(20, True),
+            fill=state_color,
+        )
+        draw.text(
+            (1280, y + 12),
+            money(row.balance),
+            font=_font(21, True),
+            fill=GOLD,
+        )
     return _png(image)
