@@ -27,8 +27,12 @@ class Settings(BaseSettings):
     @field_validator("super_admin_ids", mode="before")
     @classmethod
     def parse_admin_ids(cls, value: object) -> object:
+        if isinstance(value, int):
+            return (value,)
         if isinstance(value, str):
             return tuple(int(item.strip()) for item in value.split(",") if item.strip())
+        if isinstance(value, list):
+            return tuple(int(item) for item in value)
         return value
 
     @property
