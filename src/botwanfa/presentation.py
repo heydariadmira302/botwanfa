@@ -227,6 +227,7 @@ def result_caption(
     source: str,
     *,
     reference: str | None = None,
+    heading: str = "开奖结果",
 ) -> str:
     combination = f"{'大' if outcome.is_big else '小'}{'单' if outcome.is_odd else '双'}"
     labels = ["大" if outcome.is_big else "小", "单" if outcome.is_odd else "双", combination]
@@ -240,7 +241,7 @@ def result_caption(
         else "机器人掷骰"
     )
     return (
-        f"<b>🎯 第 <code>{_round_label(round_number, reference)}</code> 期 · 开奖结果</b>\n"
+        f"<b>🎯 第 <code>{_round_label(round_number, reference)}</code> 期 · {heading}</b>\n"
         f"点数：<b>{outcome.dice[0]} - {outcome.dice[1]} - {outcome.dice[2]}</b>　"
         f"和值：<b>{outcome.total}</b>\n"
         f"命中：<b>{' / '.join(labels)}</b>\n"
@@ -254,12 +255,14 @@ def settlement_text(
     *,
     reference: str | None = None,
 ) -> str:
-    lines = [
-        f"<b>💰 第 <code>{_round_label(round_number, reference)}</code> 期 · 结算完成</b>"
-    ]
+    heading = f"<b>💰 第 <code>{_round_label(round_number, reference)}</code> 期 · 结算完成</b>"
+    return f"{heading}\n\n{settlement_body_text(rows)}"
+
+
+def settlement_body_text(rows: Sequence[SettlementSummary]) -> str:
     if not rows:
-        lines.append("\n本期无人投注。")
-        return "\n".join(lines)
+        return "本期无人投注。"
+    lines: list[str] = []
     total_wagered = sum((row.wagered for row in rows), Decimal("0.00"))
     total_returned = sum((row.returned for row in rows), Decimal("0.00"))
     total_net = total_returned - total_wagered
@@ -297,8 +300,8 @@ def result_settlement_text(
     reference: str | None = None,
 ) -> str:
     return (
-        f"{result_caption(round_number, outcome, source, reference=reference)}\n\n"
-        f"{settlement_text(round_number, rows, reference=reference)}"
+        f"{result_caption(round_number, outcome, source, reference=reference, heading='开奖及结算')}\n\n"
+        f"<b>💰 玩家结算</b>\n{settlement_body_text(rows)}"
     )
 
 

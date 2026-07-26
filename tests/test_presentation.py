@@ -225,9 +225,10 @@ def test_result_and_normal_settlement_are_combined_after_the_trend() -> None:
     )
     assert image_size(trend) == (1680, 1169)
     assert telegram_text_length(text) <= 4096
-    assert "开奖结果" in text
-    assert "结算完成" in text
+    assert "开奖及结算" in text
+    assert "玩家结算" in text
     assert f"<code>{reference}</code>" in text
+    assert text.count(reference) == 1
     assert all(f"tg://user?id={1000 + index}" in text for index in range(3))
 
 

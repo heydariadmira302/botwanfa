@@ -429,6 +429,7 @@ async def send_round_result(
         current_outcome,
         current_dice.source,
         reference=reference,
+        heading="开奖及结算",
     )
     if not payload.get("trend_sent"):
         image = await asyncio.to_thread(render_trend_image, points, round_number)
@@ -461,7 +462,7 @@ async def send_round_result(
             reference,
         )
         summary_caption = caption_with_player_mentions(
-            f"{result}\n\n<b>💰 结算完成</b>\n人数较多，完整结算见图。",
+            f"{result}\n\n<b>💰 玩家结算</b>\n人数较多，完整结算见图。",
             [(row.user_id, row.display_name) for row in settlements],
         )
         await bot.send_photo(
