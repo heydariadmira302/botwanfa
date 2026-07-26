@@ -16,7 +16,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.engine import make_url
 
 from botwanfa.backup_crypto import encrypt_file
@@ -78,6 +78,21 @@ ODDS_LABELS = {
     "any_triple": "任意豹子",
     "specific_triple": "指定豹子",
 }
+ODDS_CATEGORIES = {
+    "basic": ("大小单双", ("big", "small", "odd", "even")),
+    "combo": ("组合玩法", ("big_odd", "big_even", "small_odd", "small_even")),
+    "sum": ("和值 3-18", ("sum",)),
+    "special": ("顺子与豹子", ("straight", "any_triple", "specific_triple")),
+}
+ODDS_BATCH_CATEGORIES = {"basic", "combo", "sum"}
+ODDS_TYPE_ORDER = {
+    bet_type: index
+    for index, bet_type in enumerate(
+        bet_type
+        for _, bet_types in ODDS_CATEGORIES.values()
+        for bet_type in bet_types
+    )
+}
 ACTION_LABELS = {
     "group_paused": "暂停群运行",
     "group_resumed": "恢复群运行",
@@ -111,7 +126,7 @@ def admin_menu_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [_button("📊 运行总览", "a:o"), _button("🎮 群管理", "a:gl:0:manage")],
-            [_button("🔎 查询玩家", "a:us:0"), _button("💳 玩家上下分", "a:us:0")],
+            [_button("🔎 查询玩家", "a:us:0"), _button("💳 玩家上下分", "a:gl:0:players")],
             [_button("🏆 群排行榜", "a:gl:0:ranking"), _button("📈 数据报表", "a:gl:0:report")],
             [_button("🧾 操作日志", "a:l:0"), _button("💾 备份恢复", "a:bk")],
             [_button("🧪 测试模式", "a:gl:0:test"), _button("📖 玩法说明", "a:rules")],
@@ -312,7 +327,7 @@ async def _group_view(session_factory, group_id: int) -> tuple[str, InlineKeyboa
         inline_keyboard=[
             [_button(toggle, f"a:p:{group_id}"), _button("🔄 刷新", f"a:g:{group_id}")],
             [_button("⏱ 时间设置", f"a:t:{group_id}"), _button("💰 底注与掷骰", f"a:b:{group_id}")],
-            [_button("🎯 倍率设置", f"a:ol:{group_id}:0"), _button("🎁 签到与连胜", f"a:w:{group_id}")],
+            [_button("🎯 倍率设置", f"a:oc:{group_id}"), _button("🎁 签到与连胜", f"a:w:{group_id}")],
             [_button("👤 玩家管理", f"a:pl:{group_id}:0"), _button("🏆 排行榜", f"a:r:{group_id}:day")],
             [_button("📈 走势与报表", f"a:d:{group_id}"), _button("🧪 测试模式", f"a:x:{group_id}")],
             [_button("📣 发送玩法说明", f"a:pub:{group_id}")],
@@ -364,14 +379,19 @@ async def _basic_view(session_factory, group_id: int) -> tuple[str, InlineKeyboa
         f"玩家掷骰门槛：<b>{threshold}</b>\n\n"
         "门槛按本期累计有效投注额判断。多人达标时，投注最高者优先。"
     )
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [_button("✏️ 修改最低下注", f"a:i:{group_id}:min")],
-            [_button("✏️ 修改掷骰门槛", f"a:i:{group_id}:dice")],
-            [_button("🚫 关闭玩家掷骰", f"a:pd:{group_id}:off")],
-            [_button("⬅️ 返回群控制台", f"a:g:{group_id}")],
-        ]
-    )
+    rows = [
+        [_button("✏️ 修改最低下注", f"a:i:{group_id}:min")],
+        [
+            _button(
+                "✏️ 设置掷骰门槛" if settings.player_dice_threshold is None else "✏️ 修改掷骰门槛",
+                f"a:i:{group_id}:dice",
+            )
+        ],
+    ]
+    if settings.player_dice_threshold is not None:
+        rows.append([_button("🚫 关闭玩家掷骰", f"a:pd:{group_id}:off")])
+    rows.append([_button("⬅️ 返回群控制台", f"a:g:{group_id}")])
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, markup
 
 
@@ -382,48 +402,94 @@ def _odds_name(row: OddsSetting) -> str:
     return base
 
 
+def _odds_category_for(row: OddsSetting) -> str:
+    for category, (_, bet_types) in ODDS_CATEGORIES.items():
+        if row.bet_type in bet_types:
+            return category
+    return "basic"
+
+
+def _odds_sort_key(row: OddsSetting) -> tuple[int, int | str]:
+    value: int | str = int(row.bet_value) if row.bet_value.isdigit() else row.bet_value
+    return ODDS_TYPE_ORDER.get(row.bet_type, len(ODDS_TYPE_ORDER)), value
+
+
+def _odds_menu_markup(group_id: int, odds: list[OddsSetting]) -> InlineKeyboardMarkup:
+    buttons: list[InlineKeyboardButton] = []
+    for category, (label, bet_types) in ODDS_CATEGORIES.items():
+        items = [item for item in odds if item.bet_type in bet_types]
+        enabled = sum(item.enabled for item in items)
+        buttons.append(
+            _button(f"{label} · {enabled}/{len(items)}", f"a:oc:{group_id}:{category}")
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            buttons[:2],
+            buttons[2:],
+            [_button("⬅️ 返回群控制台", f"a:g:{group_id}")],
+        ]
+    )
+
+
+def _odds_items_markup(
+    group_id: int, odds: list[OddsSetting], category: str
+) -> InlineKeyboardMarkup:
+    columns = 3 if category == "sum" else 2
+    item_buttons = [
+        _button(
+            f"{'✅' if item.enabled else '⛔'} {_odds_name(item)} ×{item.payout_multiplier}",
+            f"a:oi:{group_id}:{item.id}:{category}",
+        )
+        for item in sorted(odds, key=_odds_sort_key)
+    ]
+    rows = [item_buttons[index : index + columns] for index in range(0, len(item_buttons), columns)]
+    if category in ODDS_BATCH_CATEGORIES:
+        rows.append([_button("⚙️ 统一设置本类倍率", f"a:ob:{group_id}:{category}")])
+    rows.append(
+        [
+            _button("⬅️ 返回倍率分类", f"a:oc:{group_id}"),
+            _button("🏠 群控制台", f"a:g:{group_id}"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def _odds_view(
-    session_factory, group_id: int, page: int
+    session_factory, group_id: int, category: str | None = None
 ) -> tuple[str, InlineKeyboardMarkup]:
     async with session_factory() as session:
         group = await session.get(TelegramGroup, group_id)
-        total = int(
-            await session.scalar(
-                select(func.count(OddsSetting.id)).where(OddsSetting.group_id == group_id)
-            )
-            or 0
-        )
         odds = (
             await session.scalars(
                 select(OddsSetting)
                 .where(OddsSetting.group_id == group_id)
-                .order_by(OddsSetting.bet_type, OddsSetting.bet_value)
-                .offset(page * PAGE_SIZE)
-                .limit(PAGE_SIZE)
             )
         ).all()
-    rows = [
-        [
-            _button(
-                f"{'✅' if item.enabled else '🚫'} {_odds_name(item)}  ×{item.payout_multiplier}",
-                f"a:oi:{group_id}:{item.id}",
-            )
-        ]
-        for item in odds
-    ]
-    nav = []
-    if page > 0:
-        nav.append(_button("⬅️ 上一页", f"a:ol:{group_id}:{page - 1}"))
-    if (page + 1) * PAGE_SIZE < total:
-        nav.append(_button("下一页 ➡️", f"a:ol:{group_id}:{page + 1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([_button("⬅️ 返回群控制台", f"a:g:{group_id}")])
-    text = (
-        f"<b>🎯 {escape(group.title if group else str(group_id))} · 倍率设置</b>\n\n"
-        f"共 {total} 个赔率项。点击项目后输入返还倍数，返还额包含本金。"
+    if group is None:
+        return "群资料不存在。", InlineKeyboardMarkup(inline_keyboard=[_home_button()])
+    total = len(odds)
+    if category not in ODDS_CATEGORIES:
+        text = (
+            f"<b>🎯 {escape(group.title)} · 倍率设置</b>\n\n"
+            f"共 {total} 个赔率项，已按玩法分成 4 类。进入分类即可一次查看全部项目，"
+            "无需逐页翻找。\n\n✅ 表示启用，⛔ 表示停用；返还倍数包含本金。"
+        )
+        return text, _odds_menu_markup(group_id, odds)
+
+    category_label, bet_types = ODDS_CATEGORIES[category]
+    category_odds = [item for item in odds if item.bet_type in bet_types]
+    enabled = sum(item.enabled for item in category_odds)
+    batch_hint = (
+        "也可统一设置本类全部倍率。"
+        if category in ODDS_BATCH_CATEGORIES
+        else "不同特殊玩法的倍率差异较大，请逐项修改。"
     )
-    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+    text = (
+        f"<b>🎯 {escape(group.title)} · {category_label}</b>\n\n"
+        f"已启用 {enabled}/{len(category_odds)} 项。点击单项修改倍率或启停；"
+        f"{batch_hint}"
+    )
+    return text, _odds_items_markup(group_id, category_odds, category)
 
 
 async def _welfare_view(session_factory, group_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -954,7 +1020,11 @@ async def admin_callback(
                 await _audit(session, admin_id, "setting_changed", group_id, field="player_dice_threshold", value=None)
         await _show(query, *(await _basic_view(session_factory, group_id)))
     elif action == "ol":
-        await _show(query, *(await _odds_view(session_factory, int(parts[2]), int(parts[3]))))
+        # Compatibility for buttons sent by versions that used numbered odds pages.
+        await _show(query, *(await _odds_view(session_factory, int(parts[2]))))
+    elif action == "oc":
+        category = parts[3] if len(parts) > 3 else None
+        await _show(query, *(await _odds_view(session_factory, int(parts[2]), category)))
     elif action == "oi":
         group_id, odds_id = int(parts[2]), int(parts[3])
         async with session_factory() as session:
@@ -962,13 +1032,81 @@ async def admin_callback(
         if odds is None or odds.group_id != group_id:
             await query.message.answer("赔率项目不存在。")
             return
+        category = parts[4] if len(parts) > 4 else _odds_category_for(odds)
+        return_to = f"a:oc:{group_id}:{category}"
         await state.set_state(AdminInput.setting_value)
-        await state.set_data({"kind": "odds", "group_id": group_id, "odds_id": odds_id, "return_to": f"a:ol:{group_id}:0"})
-        await query.message.answer(
-            f"请输入 <b>{escape(_odds_name(odds))}</b> 的返还倍数。\n当前值：{odds.payout_multiplier}\n示例：<code>2.00</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_button("取消", f"a:ol:{group_id}:0")]]),
+        await state.set_data(
+            {
+                "kind": "odds",
+                "group_id": group_id,
+                "odds_id": odds_id,
+                "category": category,
+                "return_to": return_to,
+            }
         )
+        await query.message.answer(
+            f"请输入 <b>{escape(_odds_name(odds))}</b> 的返还倍数。\n"
+            f"当前值：{odds.payout_multiplier} · 当前状态：{'启用' if odds.enabled else '停用'}\n"
+            "示例：<code>2.00</code>\n\n修改倍率不会改变启停状态。",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        _button(
+                            "⛔ 停用此玩法" if odds.enabled else "✅ 启用此玩法",
+                            f"a:oe:{group_id}:{odds_id}:{category}",
+                        )
+                    ],
+                    [_button("取消并返回", return_to)],
+                ]
+            ),
+        )
+    elif action == "ob":
+        group_id, category = int(parts[2]), parts[3]
+        if category not in ODDS_BATCH_CATEGORIES:
+            await _show(query, *(await _odds_view(session_factory, group_id)))
+            return
+        label = ODDS_CATEGORIES[category][0]
+        return_to = f"a:oc:{group_id}:{category}"
+        await state.set_state(AdminInput.setting_value)
+        await state.set_data(
+            {
+                "kind": "odds_batch",
+                "group_id": group_id,
+                "category": category,
+                "return_to": return_to,
+            }
+        )
+        await query.message.answer(
+            f"请输入 <b>{escape(label)}</b> 全部项目的新返还倍数。\n"
+            "这会统一修改本类倍率，但保持每个项目当前的启停状态。\n"
+            "示例：<code>6.00</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[_button("取消并返回", return_to)]]
+            ),
+        )
+    elif action == "oe":
+        group_id, odds_id = int(parts[2]), int(parts[3])
+        category = parts[4] if len(parts) > 4 else None
+        async with session_factory() as session, session.begin():
+            odds = await session.get(OddsSetting, odds_id, with_for_update=True)
+            settings = await session.get(GameSettings, group_id, with_for_update=True)
+            if odds is None or odds.group_id != group_id or settings is None:
+                await query.message.answer("赔率项目不存在。")
+                return
+            odds.enabled = not odds.enabled
+            settings.version += 1
+            category = category or _odds_category_for(odds)
+            await _audit(
+                session,
+                admin_id,
+                "odds_changed",
+                group_id,
+                field=f"odds:{odds.bet_type}:{odds.bet_value}:enabled",
+                value=odds.enabled,
+            )
+        await _show(query, *(await _odds_view(session_factory, group_id, category)))
     elif action == "w":
         await _show(query, *(await _welfare_view(session_factory, int(parts[2]))))
     elif action == "st":
@@ -1175,7 +1313,9 @@ async def admin_callback(
         await query.message.answer(
             f"请输入 <b>{label}</b> 的新值。\n要求：{hint}",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_button("取消", f"a:g:{group_id}")]]),
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[_button("取消并返回", return_to)]]
+            ),
         )
 
 
@@ -1201,8 +1341,31 @@ async def admin_setting_input(message: Message, session_factory, state: FSMConte
                 if odds is None or odds.group_id != group_id or amount <= 0:
                     raise ValueError("返还倍数必须大于0")
                 odds.payout_multiplier = amount
-                odds.enabled = True
                 field = f"odds:{odds.bet_type}:{odds.bet_value}"
+                saved = amount
+                audit_action = "odds_changed"
+            elif kind == "odds_batch":
+                category = str(values["category"])
+                category_config = ODDS_CATEGORIES.get(category)
+                amount = Decimal(raw).quantize(Decimal("0.01"))
+                if category_config is None or amount <= 0:
+                    raise ValueError("返还倍数必须大于0")
+                bet_types = category_config[1]
+                odds_rows = (
+                    await session.scalars(
+                        select(OddsSetting)
+                        .where(
+                            OddsSetting.group_id == group_id,
+                            OddsSetting.bet_type.in_(bet_types),
+                        )
+                        .with_for_update()
+                    )
+                ).all()
+                if not odds_rows:
+                    raise ValueError("该分类没有赔率项目")
+                for odds in odds_rows:
+                    odds.payout_multiplier = amount
+                field = f"odds_category:{category}"
                 saved = amount
                 audit_action = "odds_changed"
             elif kind == "streak":
@@ -1262,8 +1425,18 @@ async def admin_setting_input(message: Message, session_factory, state: FSMConte
         await message.answer(f"输入有误：{escape(str(exc))}。请重新输入。", parse_mode=ParseMode.HTML)
         return
     await state.clear()
+    if kind in {"odds", "odds_batch"}:
+        category = str(values["category"])
+        text, markup = await _odds_view(session_factory, group_id, category)
+        await message.answer(
+            "✅ 倍率已保存；新投注立即使用新倍率，已经受理的投注保持原倍率。\n\n"
+            f"{text}",
+            reply_markup=markup,
+            parse_mode=ParseMode.HTML,
+        )
+        return
     await message.answer(
-        "设置已保存；游戏参数从下一期生效。",
+        "设置已保存。",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_button("返回设置", return_to)]]),
     )
 
@@ -1286,11 +1459,23 @@ async def admin_player_search(message: Message, session_factory, state: FSMConte
         elif raw.lstrip("-").isdigit():
             query = query.where(User.id == int(raw))
         else:
-            username = raw.lstrip("@").strip()
-            query = query.where(func.lower(User.username) == username.lower())
+            keyword = raw.lstrip("@").strip().lower()
+            query = query.where(
+                or_(
+                    func.lower(User.username) == keyword,
+                    func.lower(User.display_name).contains(keyword),
+                )
+            )
         users = (await session.scalars(query.limit(20))).all()
     if not users:
-        await message.answer("该群数据库中没有找到这个玩家，请重新输入。")
+        await message.answer(
+            "没有找到这个玩家，请检查昵称、@用户名或数字ID后重试。",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [_button("取消并返回", f"a:pl:{group_id}:0" if group_id else "a:h")]
+                ]
+            ),
+        )
         return
     await state.clear()
     if len(users) == 1:
@@ -1303,7 +1488,7 @@ async def admin_player_search(message: Message, session_factory, state: FSMConte
     rows = [
         [
             _button(
-                f"{user.display_name} · {user.id}",
+                f"{user.display_name[:20]} · {user.id}",
                 f"a:u:{group_id}:{user.id}:all" if group_id else f"a:ug:{user.id}",
             )
         ]
