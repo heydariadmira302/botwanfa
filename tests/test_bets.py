@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from botwanfa.domain.bets import BetParseError, BetType, parse_bets
+from botwanfa.domain.bets import BetParseError, BetType, looks_like_bet, parse_bets
 
 
 def test_parse_all_supported_forms_in_one_atomic_message() -> None:
@@ -36,3 +36,30 @@ def test_rejects_whole_message_when_any_item_is_invalid(text: str) -> None:
 def test_supports_punctuation_and_newlines() -> None:
     items = parse_bets("大100，小100；\n顺子 20、豹子20")
     assert len(items) == 4
+
+
+def test_supports_full_chinese_combination_names_and_traditional_aliases() -> None:
+    items = parse_bets(
+        "大单100 大双 200 小单300 小双 400 大單500 大雙600 小單700 小雙800"
+    )
+    assert [item.bet_type for item in items] == [
+        BetType.BIG_ODD,
+        BetType.BIG_EVEN,
+        BetType.SMALL_ODD,
+        BetType.SMALL_EVEN,
+        BetType.BIG_ODD,
+        BetType.BIG_EVEN,
+        BetType.SMALL_ODD,
+        BetType.SMALL_EVEN,
+    ]
+    assert items[2].amount == Decimal(300)
+    assert looks_like_bet("小单100")
+
+
+def test_supports_explicit_special_bet_names() -> None:
+    items = parse_bets("任意豹子100、指定豹子111 200、順子300")
+    assert [item.bet_type for item in items] == [
+        BetType.ANY_TRIPLE,
+        BetType.SPECIFIC_TRIPLE,
+        BetType.STRAIGHT,
+    ]

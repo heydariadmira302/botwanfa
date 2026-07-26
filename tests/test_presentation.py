@@ -5,6 +5,7 @@ from io import BytesIO
 
 from PIL import Image
 
+from botwanfa.apps.sender import telegram_text_length
 from botwanfa.domain.dice import evaluate_dice
 from botwanfa.presentation import (
     BetSummary,
@@ -15,7 +16,6 @@ from botwanfa.presentation import (
     load_status_animation,
     open_caption,
     render_bet_summary_pages,
-    render_round_result_image,
     render_settlement_pages,
     render_trend_image,
     result_caption,
@@ -184,7 +184,7 @@ def test_trend_image_never_grows_beyond_the_rolling_window() -> None:
     assert image_size(render_trend_image(points, 10000)) == (1680, 1169)
 
 
-def test_round_result_combines_trend_and_every_player_settlement_in_one_image() -> None:
+def test_round_trend_and_normal_settlement_stay_separate() -> None:
     points = []
     for number in range(9917, 10001):
         dice = (number % 6 + 1, (number + 1) % 6 + 1, (number + 2) % 6 + 1)
@@ -211,8 +211,13 @@ def test_round_result_combines_trend_and_every_player_settlement_in_one_image() 
         )
         for index in range(3)
     ]
-    image = render_round_result_image(points, 10000, settlements)
-    assert image_size(image) == (1680, 1578)
+    trend = render_trend_image(points, 10000)
+    reference = round_reference(-100123, 10000)
+    text = settlement_text(10000, settlements, reference=reference)
+    assert image_size(trend) == (1680, 1169)
+    assert telegram_text_length(text) <= 4096
+    assert f"<code>{reference}</code>" in text
+    assert all(f"tg://user?id={1000 + index}" in text for index in range(3))
 
 
 def test_long_bet_and_settlement_lists_are_paginated_without_omission() -> None:
@@ -241,8 +246,21 @@ def test_long_bet_and_settlement_lists_are_paginated_without_omission() -> None:
         for index in range(60)
     ]
     text = settlement_text(99, settlements)
+    assert telegram_text_length(text) <= 4096
     assert all(f"tg://user?id={1000 + index}" in text for index in range(60))
     assert "ID:" not in text
-    settlement_pages = render_settlement_pages(99, settlements)
-    assert len(settlement_pages) == 3
+    oversized_settlements = settlements + [
+        SettlementSummary(
+            user_id=1060 + index,
+            display_name=f"超长结算玩家{index}",
+            wagered=Decimal(170),
+            returned=Decimal(200),
+            net=Decimal(30),
+            balance=Decimal(1030),
+        )
+        for index in range(20)
+    ]
+    assert telegram_text_length(settlement_text(99, oversized_settlements)) > 4096
+    settlement_pages = render_settlement_pages(99, oversized_settlements)
+    assert len(settlement_pages) == 4
     assert all(image_size(page)[0] == 1500 for page in settlement_pages)

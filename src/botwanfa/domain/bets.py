@@ -40,21 +40,49 @@ _LABELS = {
     "大": BetType.BIG,
     "小": BetType.SMALL,
     "单": BetType.ODD,
+    "單": BetType.ODD,
     "双": BetType.EVEN,
+    "雙": BetType.EVEN,
     "dd": BetType.BIG_ODD,
+    "大单": BetType.BIG_ODD,
+    "大單": BetType.BIG_ODD,
     "ds": BetType.BIG_EVEN,
+    "大双": BetType.BIG_EVEN,
+    "大雙": BetType.BIG_EVEN,
     "xd": BetType.SMALL_ODD,
+    "小单": BetType.SMALL_ODD,
+    "小單": BetType.SMALL_ODD,
     "xs": BetType.SMALL_EVEN,
+    "小双": BetType.SMALL_EVEN,
+    "小雙": BetType.SMALL_EVEN,
     "顺子": BetType.STRAIGHT,
+    "順子": BetType.STRAIGHT,
     "豹子": BetType.ANY_TRIPLE,
+    "任意豹子": BetType.ANY_TRIPLE,
 }
 _SEPARATOR = re.compile(r"^[\s,，、;；]+$")
+_LABEL_PATTERN = "|".join(
+    re.escape(label) for label in sorted(_LABELS, key=len, reverse=True)
+)
 _ITEM = re.compile(
     r"(?P<sum>和值\s*(?P<sum_value>(?:[3-9]|1[0-8])))\s+(?P<sum_amount>[1-9]\d*)"
-    r"|(?P<triple>111|222|333|444|555|666)\s+(?P<triple_amount>[1-9]\d*)"
-    r"|(?P<label>顺子|豹子|dd|ds|xd|xs|大|小|单|双)\s*(?P<amount>[1-9]\d*)",
+    r"|(?:指定豹子\s*)?(?P<triple>111|222|333|444|555|666)\s+"
+    r"(?P<triple_amount>[1-9]\d*)"
+    rf"|(?P<label>{_LABEL_PATTERN})\s*(?P<amount>[1-9]\d*)",
     re.IGNORECASE,
 )
+_BET_INTENT = re.compile(
+    r"(?:^|[\s,，、;；])(?:"
+    r"和值\s*\d|"
+    r"(?:指定豹子\s*)?(?:111|222|333|444|555|666)\s+\d|"
+    rf"(?:{_LABEL_PATTERN})\s*\d"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def looks_like_bet(text: str) -> bool:
+    return bool(_BET_INTENT.search(text.strip()))
 
 
 def parse_bets(text: str) -> list[BetItem]:

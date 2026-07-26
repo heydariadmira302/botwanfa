@@ -1,5 +1,4 @@
 import asyncio
-import re
 import secrets
 from datetime import UTC, datetime, timedelta
 from html import escape
@@ -27,7 +26,7 @@ from botwanfa.db.models import (
     WalletLedger,
 )
 from botwanfa.db.session import create_engine_and_session
-from botwanfa.domain.bets import BetParseError, parse_bets
+from botwanfa.domain.bets import BetParseError, looks_like_bet, parse_bets
 from botwanfa.domain.state_machine import RoundStatus
 from botwanfa.logging import configure_logging
 from botwanfa.presentation import bet_item_text, player_mention, rules_text, success_bet_text
@@ -39,18 +38,6 @@ betting = BettingService()
 log = structlog.get_logger()
 __all__ = ["admin_menu_markup"]
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
-BET_INTENT = re.compile(
-    r"(?:^|[\s,，、;；])(?:"
-    r"和值\s*\d|"
-    r"(?:大|小|单|双|dd|ds|xd|xs|顺子|豹子)\s*\d|"
-    r"(?:111|222|333|444|555|666)\s+\d"
-    r")",
-    re.IGNORECASE,
-)
-
-
-def looks_like_bet(text: str) -> bool:
-    return bool(BET_INTENT.search(text.strip()))
 
 
 async def ensure_participant(message: Message, session_factory) -> None:

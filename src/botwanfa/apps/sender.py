@@ -1,8 +1,9 @@
 import asyncio
+import re
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from html import escape
+from html import escape, unescape
 
 import structlog
 from aiogram import Bot
@@ -53,12 +54,19 @@ from botwanfa.presentation import (
     open_caption,
     player_mention,
     render_bet_summary_pages,
-    render_round_result_image,
+    render_settlement_pages,
+    render_trend_image,
     result_caption,
     round_reference,
+    settlement_text,
 )
 
 log = structlog.get_logger()
+HTML_TAG = re.compile(r"<[^>]+>")
+
+
+def telegram_text_length(text: str) -> int:
+    return len(unescape(HTML_TAG.sub("", text)))
 
 
 def template_message_markup(
@@ -149,6 +157,13 @@ async def mark_failed(session_factory, message_id: int, error: str) -> None:
                 round_ = await session.get(Round, int(row.payload["round_id"]))
                 if round_:
                     round_.status = RoundStatus.MANUAL_REVIEW.value
+
+
+async def save_outbox_progress(session_factory, message_id: int, **progress) -> None:
+    async with session_factory() as session, session.begin():
+        row = await session.get(OutboxMessage, message_id, with_for_update=True)
+        if row:
+            row.payload = {**row.payload, **progress}
 
 
 async def legacy_result_was_combined(session_factory, round_id: int) -> bool:
@@ -356,7 +371,11 @@ async def send_player_dice_invite(
 
 
 async def send_round_result(
-    bot: Bot, session_factory, group_id: int, payload: dict
+    bot: Bot,
+    session_factory,
+    outbox_id: int,
+    group_id: int,
+    payload: dict,
 ) -> None:
     round_id = int(payload["round_id"])
     round_number = int(payload["round_number"])
@@ -413,9 +432,6 @@ async def send_round_result(
         (current_dice.die_1, current_dice.die_2, current_dice.die_3)
     )
     settlements = await load_settlement_summaries(session_factory, round_id)
-    image = await asyncio.to_thread(
-        render_round_result_image, points, round_number, settlements
-    )
     caption = result_caption(
         round_number,
         current_outcome,
@@ -426,25 +442,46 @@ async def send_round_result(
         caption,
         [(user_id, display_name) for user_id, display_name in participants],
     )
-    filename = f"round-{round_number}-result.png"
-    if len(settlements) <= 100:
+    if not payload.get("trend_sent"):
+        image = await asyncio.to_thread(render_trend_image, points, round_number)
         await bot.send_photo(
             group_id,
-            BufferedInputFile(image, filename=filename),
+            BufferedInputFile(image, filename=f"round-{round_number}-trend.png"),
             caption=caption,
             reply_markup=await load_template_markup(
                 session_factory, group_id, "round_result"
             ),
         )
+        await save_outbox_progress(session_factory, outbox_id, trend_sent=True)
+
+    if payload.get("settlement_sent"):
+        return
+    summary = settlement_text(
+        round_number,
+        settlements,
+        reference=reference,
+    )
+    if telegram_text_length(summary) <= 4096:
+        await bot.send_message(group_id, summary)
     else:
-        await bot.send_document(
-            group_id,
-            BufferedInputFile(image, filename=filename),
-            caption=caption,
-            reply_markup=await load_template_markup(
-                session_factory, group_id, "round_result"
-            ),
+        pages = await asyncio.to_thread(
+            render_settlement_pages,
+            round_number,
+            settlements,
+            reference,
         )
+        summary_caption = caption_with_player_mentions(
+            "<b>本期全员结算</b>\n人数较多，已转为结算图片。",
+            [(row.user_id, row.display_name) for row in settlements],
+        )
+        await send_photo_pages(
+            bot,
+            group_id,
+            pages,
+            caption=summary_caption,
+            filename_prefix=f"round-{round_number}-settlement",
+        )
+    await save_outbox_progress(session_factory, outbox_id, settlement_sent=True)
 
 
 async def load_settlement_summaries(
@@ -604,7 +641,9 @@ async def run() -> None:
                 elif message_type == "dice_round":
                     await send_dice_round(bot, factory, message_id, group_id, payload)
                 elif message_type in {"round_result", "trend_result"}:
-                    await send_round_result(bot, factory, group_id, payload)
+                    await send_round_result(
+                        bot, factory, message_id, group_id, payload
+                    )
                     combined_result_sent = True
                 elif message_type == "settlement_summary":
                     round_id = int(payload["round_id"])
@@ -615,7 +654,9 @@ async def run() -> None:
                             group_id=group_id,
                         )
                     else:
-                        await send_round_result(bot, factory, group_id, payload)
+                        await send_round_result(
+                            bot, factory, message_id, group_id, payload
+                        )
                         combined_result_sent = True
                 else:
                     raise ValueError(f"unknown outbox message type: {message_type}")

@@ -43,6 +43,8 @@ def test_betting_window_reports_closed_and_expired_rounds() -> None:
 
 def test_bet_intent_detection_does_not_interrupt_normal_group_chat() -> None:
     assert looks_like_bet("大100")
+    assert looks_like_bet("小单100")
+    assert looks_like_bet("大雙100")
     assert looks_like_bet("和值19 20")
     assert looks_like_bet("聊天内容，dd100")
     assert not looks_like_bet("大家晚上好")
@@ -62,6 +64,7 @@ def test_admin_menu_has_expected_buttons() -> None:
     assert "💾 备份恢复" in labels
     assert "🧪 测试模式" in labels
     assert "📖 玩法说明" in labels
+    assert "📨 发送队列" in labels
 
 
 def test_admin_callback_data_fits_telegram_limit() -> None:

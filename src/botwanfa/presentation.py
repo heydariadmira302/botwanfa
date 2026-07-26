@@ -166,7 +166,8 @@ def open_caption(
         f"⏳ {betting_seconds} 秒　最低下注 <b>{money(minimum_bet)}</b>\n\n"
         "<b>下注格式</b>\n"
         "大小单双：<code>大100　小100　单100　双100</code>\n"
-        "组合：<code>dd100　ds100　xd100　xs100</code>\n"
+        "组合：<code>大单100　大双100　小单100　小双100</code>\n"
+        "组合缩写：<code>dd100　ds100　xd100　xs100</code>\n"
         "和值：<code>和值 10 100</code>\n"
         "特殊：<code>顺子100　豹子100　111 100</code>\n\n"
         "可在一条消息中发送多项；任一项有误，整条不扣分。"
@@ -247,8 +248,15 @@ def result_caption(
     )
 
 
-def settlement_text(round_number: int, rows: Sequence[SettlementSummary]) -> str:
-    lines = [f"<b>💰 第 <code>{round_code(round_number)}</code> 期 · 结算完成</b>"]
+def settlement_text(
+    round_number: int,
+    rows: Sequence[SettlementSummary],
+    *,
+    reference: str | None = None,
+) -> str:
+    lines = [
+        f"<b>💰 第 <code>{_round_label(round_number, reference)}</code> 期 · 结算完成</b>"
+    ]
     if not rows:
         lines.append("\n本期无人投注。")
         return "\n".join(lines)
@@ -307,7 +315,7 @@ def rules_text(odds: dict[tuple[str, str], Decimal], minimum_bet: Decimal) -> st
         "豹子仍同时参与大小、单双、组合和和值判定。\n"
         "返还额包含本金：返还额 = 投注额 × 本期倍率。\n\n"
         f"本群最低下注：<b>{money(minimum_bet)}</b>\n"
-        "下注示例：<code>大100、dd100、和值 10 100、顺子100、111 100</code>\n\n"
+        "下注示例：<code>大100、小单100、dd100、和值 10 100、顺子100、111 100</code>\n\n"
         "常用查询：余额、签到/qd、日榜、周榜、月榜"
     )
 
@@ -467,7 +475,9 @@ def render_bet_summary_pages(
 
 
 def render_settlement_pages(
-    round_number: int, rows: Sequence[SettlementSummary]
+    round_number: int,
+    rows: Sequence[SettlementSummary],
+    reference: str | None = None,
 ) -> list[bytes]:
     width = 1500
     per_page = 22
@@ -479,7 +489,7 @@ def render_settlement_pages(
         draw = ImageDraw.Draw(image)
         _header(
             draw,
-            title=f"第 {round_code(round_number)} 期  全员结算",
+            title=f"第 {_round_label(round_number, reference)} 期  全员结算",
             subtitle=f"投注 / 返还 / 净输赢 / 最终余额  ·  第 {page_index}/{len(chunks)} 页",
             width=width,
             accent=GOLD,
@@ -578,90 +588,4 @@ def render_trend_image(points: Sequence[TrendPoint], current_round: int) -> byte
         font=_font(20),
         fill=MUTED,
     )
-    return _png(image)
-
-
-def render_round_result_image(
-    points: Sequence[TrendPoint],
-    current_round: int,
-    rows: Sequence[SettlementSummary],
-) -> bytes:
-    trend = Image.open(io.BytesIO(render_trend_image(points, current_round))).convert("RGB")
-    width = 1680
-    section_y = trend.height + 20
-    summary_height = 125
-    headings_y = section_y + summary_height + 18
-    rows_y = headings_y + 42
-    row_height = 58
-    data_height = max(75, len(rows) * row_height)
-    height = rows_y + data_height + 30
-    image = Image.new("RGB", (width, height), CANVAS)
-    image.paste(trend, ((width - trend.width) // 2, 0))
-    draw = ImageDraw.Draw(image)
-
-    total_wagered = sum((row.wagered for row in rows), Decimal("0.00"))
-    total_returned = sum((row.returned for row in rows), Decimal("0.00"))
-    total_net = total_returned - total_wagered
-    net_sign = "+" if total_net > 0 else ""
-    draw.rectangle((0, section_y, width, section_y + summary_height), fill=PANEL)
-    draw.rectangle((0, section_y, 16, section_y + summary_height), fill=GOLD)
-    draw.text((55, section_y + 22), "本期全员结算", font=_font(42, True), fill=WHITE)
-    draw.text(
-        (58, section_y + 78),
-        (
-            f"参与 {len(rows)} 人  ·  投注 {money(total_wagered)}  ·  "
-            f"返还 {money(total_returned)}  ·  玩家净输赢 {net_sign}{money(total_net)}"
-        ),
-        font=_font(23),
-        fill=MUTED,
-    )
-    headings = (
-        (55, "玩家"),
-        (760, "投注"),
-        (980, "返还"),
-        (1200, "净输赢"),
-        (1460, "最终余额"),
-    )
-    for x, heading in headings:
-        draw.text((x, headings_y), heading, font=_font(22, True), fill=MUTED)
-    if not rows:
-        draw.text(
-            (width // 2, rows_y + 20),
-            "本期无人投注",
-            font=_font(34, True),
-            fill=MUTED,
-            anchor="ma",
-        )
-        return _png(image)
-
-    for index, row in enumerate(rows):
-        y = rows_y + index * row_height
-        fill = PANEL if index % 2 == 0 else PANEL_ALT
-        draw.rectangle((35, y, width - 35, y + row_height - 5), fill=fill)
-        state_color = GREEN if row.net > 0 else (RED if row.net < 0 else MUTED)
-        draw.ellipse((55, y + 18, 71, y + 34), fill=state_color)
-        draw.text(
-            (85, y + 12),
-            f"{index + 1:02d}  {row.display_name[:24]}",
-            font=_font(22, True),
-            fill=WHITE,
-        )
-        draw.text((760, y + 12), money(row.wagered), font=_font(21), fill=WHITE)
-        draw.text((980, y + 12), money(row.returned), font=_font(21), fill=WHITE)
-        sign = "+" if row.net > 0 else ""
-        reward = (
-            f"  奖+{money(row.streak_reward)}" if row.streak_reward > 0 else ""
-        )
-        draw.text(
-            (1200, y + 12),
-            f"{sign}{money(row.net)}{reward}",
-            font=_font(20, True),
-            fill=state_color,
-        )
-        draw.text(
-            (1460, y + 12),
-            money(row.balance),
-            font=_font(21, True),
-            fill=GOLD,
-        )
     return _png(image)

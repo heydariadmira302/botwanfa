@@ -106,6 +106,7 @@ ACTION_LABELS = {
     "rules_published": "发送玩法说明",
     "backup_created": "立即备份",
     "message_retried": "重试发送消息",
+    "failed_message_deleted": "删除发送失败记录",
     "message_button_added": "添加消息按钮",
     "message_button_deleted": "删除消息按钮",
 }
@@ -308,7 +309,7 @@ async def _message_queue_view(
         lines = [
             "<b>📨 发送失败队列</b>",
             "",
-            f"共 {total} 条，第 {page + 1} 页。请先查看错误原因，再选择重试。",
+            f"共 {total} 条，第 {page + 1} 页。可重试或删除失败记录。",
         ]
         for row in rows:
             message_type = MESSAGE_TYPE_LABELS.get(row.message_type, row.message_type)
@@ -322,10 +323,14 @@ async def _message_queue_view(
                 )
             )
         text = "\n".join(lines)
-    buttons = [
-        [_button(f"🔄 重试 #{row.id}", f"a:mr:{row.id}:{page}")]
-        for row in rows
-    ]
+    buttons = []
+    for row in rows:
+        buttons.append(
+            [
+                _button(f"🔄 重试 #{row.id}", f"a:mr:{row.id}:{page}"),
+                _button("🗑 删除", f"a:mqx:{row.id}:{page}"),
+            ]
+        )
     nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(_button("⬅️ 上一页", f"a:mq:{page - 1}"))
@@ -334,7 +339,12 @@ async def _message_queue_view(
     if nav:
         buttons.append(nav)
     if total:
-        buttons.append([_button("🔄 全部重试", "a:ma")])
+        buttons.append(
+            [
+                _button("🔄 全部重试", "a:ma"),
+                _button("🗑 批量删除", f"a:mqax:{page}"),
+            ]
+        )
     buttons.append([_button("刷新", f"a:mq:{page}"), _button("🏠 首页", "a:h")])
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -366,6 +376,54 @@ async def _retry_failed_messages(
                 session,
                 admin_id,
                 "message_retried",
+                None,
+                message_id=message_id,
+                count=len(rows),
+            )
+    return len(rows)
+
+
+async def _delete_failed_messages(
+    session_factory, admin_id: int, message_id: int | None = None
+) -> int:
+    async with session_factory() as session, session.begin():
+        query = (
+            select(OutboxMessage)
+            .where(OutboxMessage.status == "failed")
+            .with_for_update()
+        )
+        if message_id is not None:
+            query = query.where(OutboxMessage.id == message_id)
+        rows = (await session.scalars(query)).all()
+        for row in rows:
+            if row.message_type in {"dice_round", "player_dice_invite"}:
+                round_id = int(row.payload["round_id"])
+                round_ = await session.get(Round, round_id, with_for_update=True)
+                if round_:
+                    round_.status = "bot_rolling"
+                recovery_payload = (
+                    row.payload
+                    if row.message_type == "dice_round"
+                    else {
+                        "round_id": round_id,
+                        "round_number": int(row.payload["round_number"]),
+                    }
+                )
+                session.add(
+                    OutboxMessage(
+                        group_id=row.group_id,
+                        sequence=30,
+                        message_type="dice_round",
+                        payload=recovery_payload,
+                        idempotency_key=f"admin-recovery:{row.id}:{uuid.uuid4().hex}",
+                    )
+                )
+            await session.delete(row)
+        if rows:
+            await _audit(
+                session,
+                admin_id,
+                "failed_message_deleted",
                 None,
                 message_id=message_id,
                 count=len(rows),
@@ -1212,6 +1270,51 @@ async def admin_callback(
         count = await _retry_failed_messages(session_factory, admin_id)
         await query.message.answer(f"已将 {count} 条消息重新加入发送队列。")
         await _show(query, *(await _message_queue_view(session_factory, 0)))
+    elif action == "mqx":
+        message_id, page = int(parts[2]), int(parts[3])
+        await _show(
+            query,
+            f"<b>确认删除失败记录 #{message_id}？</b>\n\n"
+            "普通通知删除后不再发送；开奖相关记录会自动创建机器人恢复任务。"
+            "操作会写入管理员日志。",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        _button("确认删除", f"a:mqd:{message_id}:{page}"),
+                        _button("取消", f"a:mq:{page}"),
+                    ]
+                ]
+            ),
+        )
+    elif action == "mqd":
+        message_id, page = int(parts[2]), int(parts[3])
+        deleted = await _delete_failed_messages(session_factory, admin_id, message_id)
+        if deleted:
+            await query.message.answer("失败记录已删除。")
+        else:
+            await query.message.answer("该记录已经处理。")
+        await _show(query, *(await _message_queue_view(session_factory, page)))
+    elif action == "mqax":
+        page = int(parts[2])
+        await _show(
+            query,
+            "<b>确认批量删除发送失败记录？</b>\n\n"
+            "普通通知会直接删除；开奖相关失败记录删除后，系统会创建机器人恢复任务，"
+            "避免当前期次中断。",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        _button("确认批量删除", f"a:mqad:{page}"),
+                        _button("取消", f"a:mq:{page}"),
+                    ]
+                ]
+            ),
+        )
+    elif action == "mqad":
+        page = int(parts[2])
+        deleted = await _delete_failed_messages(session_factory, admin_id)
+        await query.message.answer(f"已删除 {deleted} 条失败记录。")
+        await _show(query, *(await _message_queue_view(session_factory, page)))
     elif action == "gl":
         await _show(query, *(await _groups_view(session_factory, int(parts[2]), parts[3])))
     elif action == "g":
