@@ -542,6 +542,8 @@ def render_settlement_image(
     round_number: int,
     rows: Sequence[SettlementSummary],
     reference: str | None = None,
+    *,
+    title: str | None = None,
 ) -> bytes:
     width = 1500
     height = max(530, 235 + len(rows) * 78)
@@ -551,7 +553,7 @@ def render_settlement_image(
     total_returned = sum((row.returned for row in rows), Decimal("0.00"))
     _header(
         draw,
-        title=f"第 {_round_label(round_number, reference)} 期  全员结算",
+        title=title or f"第 {_round_label(round_number, reference)} 期  全员结算",
         subtitle=(
             f"共 {len(rows)} 位玩家  ·  投注 {money(total_wagered)}  ·  "
             f"返还 {money(total_returned)}"
@@ -593,6 +595,26 @@ def render_settlement_image(
         draw.text((1280, y + 15), money(row.balance), font=_font(24, True), fill=GOLD)
         y += 78
     return _png(image)
+
+
+def stack_result_images(trend_image: bytes, settlement_image: bytes) -> bytes:
+    gap = 20
+    with Image.open(io.BytesIO(trend_image)) as trend_source:
+        trend = trend_source.convert("RGB")
+    with Image.open(io.BytesIO(settlement_image)) as settlement_source:
+        settlement = settlement_source.convert("RGB")
+    width = max(trend.width, settlement.width)
+    height = trend.height + gap + settlement.height
+    combined = Image.new("RGB", (width, height), CANVAS)
+    combined.paste(trend, ((width - trend.width) // 2, 0))
+    combined.paste(settlement, ((width - settlement.width) // 2, trend.height + gap))
+    if width + height > 9500:
+        scale = 9500 / (width + height)
+        combined = combined.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    return _png(combined)
 
 
 def render_trend_image(points: Sequence[TrendPoint], current_round: int) -> bytes:

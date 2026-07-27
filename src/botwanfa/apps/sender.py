@@ -60,6 +60,7 @@ from botwanfa.presentation import (
     result_caption,
     result_settlement_text,
     round_reference,
+    stack_result_images,
 )
 
 log = structlog.get_logger()
@@ -431,15 +432,6 @@ async def send_round_result(
         reference=reference,
         heading="开奖及结算",
     )
-    if not payload.get("trend_sent"):
-        image = await asyncio.to_thread(render_trend_image, points, round_number)
-        await bot.send_photo(
-            group_id,
-            BufferedInputFile(image, filename=f"round-{round_number}-trend.png"),
-            caption=f"<b>📈 开奖走势</b>\n最近 {len(points)} 期，红框为本期。",
-        )
-        await save_outbox_progress(session_factory, outbox_id, trend_sent=True)
-
     if payload.get("settlement_sent"):
         return
     summary = result_settlement_text(
@@ -452,28 +444,35 @@ async def send_round_result(
     result_markup = await load_template_markup(
         session_factory, group_id, "round_result"
     )
-    if telegram_text_length(summary) <= 4096:
-        await bot.send_message(group_id, summary, reply_markup=result_markup)
+    trend_image = await asyncio.to_thread(render_trend_image, points, round_number)
+    if telegram_text_length(summary) <= 1024:
+        image = trend_image
+        caption = summary
+        filename = f"round-{round_number}-result.png"
     else:
         settlement_image = await asyncio.to_thread(
             render_settlement_image,
             round_number,
             settlements,
             reference,
+            title="玩家结算",
         )
-        summary_caption = caption_with_player_mentions(
+        image = await asyncio.to_thread(
+            stack_result_images,
+            trend_image,
+            settlement_image,
+        )
+        caption = caption_with_player_mentions(
             f"{result}\n\n<b>💰 玩家结算</b>\n人数较多，完整结算见图。",
             [(row.user_id, row.display_name) for row in settlements],
         )
-        await bot.send_photo(
-            group_id,
-            BufferedInputFile(
-                settlement_image,
-                filename=f"round-{round_number}-settlement.png",
-            ),
-            caption=summary_caption,
-            reply_markup=result_markup,
-        )
+        filename = f"round-{round_number}-result-full.png"
+    await bot.send_photo(
+        group_id,
+        BufferedInputFile(image, filename=filename),
+        caption=caption,
+        reply_markup=result_markup,
+    )
     await save_outbox_progress(session_factory, outbox_id, settlement_sent=True)
 
 

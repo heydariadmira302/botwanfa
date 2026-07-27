@@ -25,6 +25,7 @@ from botwanfa.presentation import (
     round_reference,
     rules_text,
     settlement_text,
+    stack_result_images,
     success_bet_text,
 )
 
@@ -186,7 +187,7 @@ def test_trend_image_never_grows_beyond_the_rolling_window() -> None:
     assert image_size(render_trend_image(points, 10000)) == (1680, 1169)
 
 
-def test_result_and_normal_settlement_are_combined_after_the_trend() -> None:
+def test_result_and_normal_settlement_fit_one_trend_photo_caption() -> None:
     points = []
     for number in range(9917, 10001):
         dice = (number % 6 + 1, (number + 1) % 6 + 1, (number + 2) % 6 + 1)
@@ -224,7 +225,7 @@ def test_result_and_normal_settlement_are_combined_after_the_trend() -> None:
         reference=reference,
     )
     assert image_size(trend) == (1680, 1169)
-    assert telegram_text_length(text) <= 4096
+    assert telegram_text_length(text) <= 1024
     assert "开奖及结算" in text
     assert "玩家结算" in text
     assert f"<code>{reference}</code>" in text
@@ -278,3 +279,6 @@ def test_long_bet_and_settlement_lists_are_paginated_without_omission() -> None:
     assert all(image_size(page)[0] == 1500 for page in settlement_pages)
     settlement_image = render_settlement_image(99, oversized_settlements)
     assert image_size(settlement_image) == (1500, 6475)
+    combined_image = stack_result_images(render_trend_image([], 99), settlement_image)
+    width, height = image_size(combined_image)
+    assert width + height <= 9500
