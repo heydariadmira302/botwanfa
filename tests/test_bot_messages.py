@@ -8,6 +8,7 @@ from botwanfa.apps.bot import (
     looks_like_bet,
 )
 from botwanfa.domain.state_machine import RoundStatus
+from botwanfa.services.provisioning import DEFAULT_STARTING_BALANCE
 
 
 def test_failure_message_escapes_name_and_mentions_by_id() -> None:
@@ -71,3 +72,7 @@ def test_admin_callback_data_fits_telegram_limit() -> None:
     markup = admin_menu_markup()
     callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
     assert all(value is not None and len(value.encode()) <= 64 for value in callbacks)
+
+
+def test_new_wallets_start_with_zero_balance() -> None:
+    assert DEFAULT_STARTING_BALANCE == 0

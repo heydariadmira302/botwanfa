@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -39,8 +40,16 @@ from botwanfa.db.models import (
     WalletLedger,
     WinningStreak,
 )
-from botwanfa.presentation import TREND_MAX_POINTS, TREND_MIN_POINTS, rules_text
+from botwanfa.presentation import (
+    TREND_MAX_POINTS,
+    TREND_MIN_POINTS,
+    bet_label,
+    money,
+    player_mention,
+    rules_text,
+)
 from botwanfa.services.drain import load_drain_progress, set_draining
+from botwanfa.services.round_audit import RoundAuditReport, load_round_audit
 
 router = Router(name="super_admin")
 PAGE_SIZE = 8
@@ -138,6 +147,7 @@ class AdminInput(StatesGroup):
     setting_value = State()
     message_button = State()
     player_search = State()
+    round_search = State()
     wallet_adjustment = State()
     wallet_confirmation = State()
 
@@ -159,13 +169,105 @@ def admin_menu_markup() -> InlineKeyboardMarkup:
             [_button("📨 发送队列", "a:mq:0"), _button("🧾 操作日志", "a:l:0")],
             [_button("🛠 平滑更新", "a:dr"), _button("💾 备份恢复", "a:bk")],
             [_button("🧪 测试模式", "a:gl:0:test")],
-            [_button("📖 玩法说明", "a:rules")],
+            [_button("🔍 期号查账", "a:rs"), _button("📖 玩法说明", "a:rules")],
         ]
     )
 
 
 def _home_button() -> list[InlineKeyboardButton]:
     return [_button("🏠 管理首页", "a:h")]
+
+
+def parse_public_round_code(text: str) -> str | None:
+    match = re.search(r"(?i)(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])", text)
+    return match.group(0).lower() if match else None
+
+
+def _signed_money(value: Decimal) -> str:
+    return f"{'+' if value > 0 else ''}{money(value)}"
+
+
+def round_audit_pages(report: RoundAuditReport) -> list[str]:
+    returned = (
+        money(report.total_returned)
+        if report.total_returned is not None
+        else "待结算"
+    )
+    net = (
+        _signed_money(report.total_net)
+        if report.total_net is not None
+        else "待结算"
+    )
+    if report.dice:
+        dice_text = (
+            f"{report.dice[0]} - {report.dice[1]} - {report.dice[2]}"
+            f"（和值 {sum(report.dice)}）"
+        )
+        dice_source = (
+            "玩家掷骰"
+            if report.dice_source and report.dice_source.startswith("player:")
+            else "机器人掷骰"
+        )
+        dice_text = f"{dice_text} · {dice_source}"
+    else:
+        dice_text = "尚未开奖"
+    header = (
+        "<b>🔍 期号查账</b>\n\n"
+        f"期号：<code>{report.public_code}</code>\n"
+        f"群：{escape(report.group_title or str(report.group_id))}\n"
+        f"状态：{STATUS_LABELS.get(report.status, report.status)}\n"
+        f"骰子：{dice_text}\n"
+        f"参与：{len(report.players)} 人　总投注：<b>{money(report.total_wagered)}</b>\n"
+        f"总返还：<b>{returned}</b>　玩家净输赢：<b>{net}</b>"
+    )
+    if not report.players:
+        return [f"{header}\n\n本期无人投注。"]
+
+    player_blocks = []
+    for index, player in enumerate(report.players, 1):
+        lines = [
+            f"{index}. {player_mention(player.user_id, player.display_name)}"
+        ]
+        for item in player.items:
+            if item.won is None:
+                result = "待结算"
+            elif item.won:
+                result = f"赢 · 返还 {money(item.payout)}"
+            else:
+                result = "输 · 返还 0.00"
+            lines.append(
+                f"• {bet_label(item.bet_type, item.bet_value)} "
+                f"{money(item.amount)} × {money(item.odds)} · {result}"
+            )
+        player_returned = money(player.returned) if player.returned is not None else "待结算"
+        player_net = _signed_money(player.net) if player.net is not None else "待结算"
+        lines.append(
+            f"合计：投注 <b>{money(player.wagered)}</b>　返还 <b>{player_returned}</b>　"
+            f"净输赢 <b>{player_net}</b>"
+        )
+        if player.streak_reward > 0:
+            lines.append(f"连胜奖励：<b>+{money(player.streak_reward)}</b>")
+        if player.balance_after is not None:
+            lines.append(f"结后余额：<b>{money(player.balance_after)}</b>")
+        player_blocks.append("\n".join(lines))
+
+    continuation = (
+        "<b>🔍 期号查账（续）</b>\n"
+        f"期号：<code>{report.public_code}</code>\n"
+        f"群：{escape(report.group_title or str(report.group_id))}"
+    )
+    pages: list[str] = []
+    current = header
+    for block in player_blocks:
+        for line in ("", *block.splitlines()):
+            candidate = f"{current}\n{line}"
+            if len(candidate) > 3800 and current != continuation:
+                pages.append(current)
+                current = continuation
+                candidate = f"{current}\n\n{line}" if line else current
+            current = candidate
+    pages.append(current)
+    return pages
 
 
 async def _audit(session, admin_id: int, action: str, group_id: int | None, **details) -> None:
@@ -1303,6 +1405,15 @@ async def admin_callback(
         await _show(query, *(await _home_view(session_factory)))
     elif action == "o":
         await _show(query, *(await _overview_view(session_factory)))
+    elif action == "rs":
+        await state.set_state(AdminInput.round_search)
+        await query.message.answer(
+            "请发送群消息中显示的 32 位期号。\n\n"
+            "可以直接粘贴整条开奖消息，机器人会自动提取期号。",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[_button("取消并返回", "a:h")]]
+            ),
+        )
     elif action == "dr":
         await _show(query, *(await _drain_view(session_factory)))
     elif action == "dx":
@@ -1964,6 +2075,44 @@ async def admin_setting_input(message: Message, session_factory, state: FSMConte
         "设置已保存。",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_button("返回设置", return_to)]]),
     )
+
+
+@router.message(AdminInput.round_search, F.chat.type == ChatType.PRIVATE)
+async def admin_round_search(message: Message, session_factory, state: FSMContext) -> None:
+    if not is_super_admin(message.from_user.id if message.from_user else None):
+        return
+    public_code = parse_public_round_code(message.text or "")
+    if public_code is None:
+        await message.answer(
+            "没有识别到 32 位期号，请检查后重新发送。",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[_button("取消并返回", "a:h")]]
+            ),
+        )
+        return
+    async with session_factory() as session:
+        report = await load_round_audit(session, public_code)
+    if report is None:
+        await message.answer(
+            f"没有找到期号 <code>{public_code}</code>，请确认期号来自当前机器人。",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[_button("取消并返回", "a:h")]]
+            ),
+        )
+        return
+    await state.clear()
+    pages = round_audit_pages(report)
+    for index, page in enumerate(pages):
+        markup = None
+        if index == len(pages) - 1:
+            markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [_button("继续查询期号", "a:rs")],
+                    _home_button(),
+                ]
+            )
+        await message.answer(page, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 @router.message(AdminInput.player_search, F.chat.type == ChatType.PRIVATE)

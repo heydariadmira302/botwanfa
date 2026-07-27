@@ -11,7 +11,7 @@ from botwanfa.db.models import BetBatch, GameSettings, OutboxMessage, Round, Tel
 from botwanfa.db.session import create_engine_and_session
 from botwanfa.domain.state_machine import RoundStatus
 from botwanfa.logging import configure_logging
-from botwanfa.presentation import TREND_MAX_POINTS, TREND_MIN_POINTS
+from botwanfa.presentation import TREND_MAX_POINTS, TREND_MIN_POINTS, round_reference
 from botwanfa.services.drain import get_deployment_control, load_drain_progress
 
 log = structlog.get_logger()
@@ -104,9 +104,11 @@ async def tick(session_factory) -> None:
                     if settings.test_mode
                     else settings.betting_seconds
                 )
+                next_round_number = int(last_number or 0) + 1
                 round_ = Round(
                     group_id=group.id,
-                    round_number=int(last_number or 0) + 1,
+                    round_number=next_round_number,
+                    public_code=round_reference(group.id, next_round_number),
                     status=RoundStatus.BETTING.value,
                     betting_opens_at=now,
                     betting_closes_at=now + timedelta(seconds=betting_seconds),

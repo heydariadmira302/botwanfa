@@ -79,6 +79,28 @@ async def ensure_participant(message: Message, session_factory) -> None:
         )
 
 
+@router.message(F.chat.type.in_(GROUP_TYPES), F.new_chat_members)
+async def register_new_members(message: Message, session_factory) -> None:
+    members = [member for member in message.new_chat_members or [] if not member.is_bot]
+    if not members:
+        return
+    async with session_factory() as session, session.begin():
+        for member in members:
+            await provision_participant(
+                session,
+                group_id=message.chat.id,
+                group_title=message.chat.title or "",
+                user_id=member.id,
+                username=member.username,
+                display_name=member.full_name,
+            )
+    mentions = "、".join(player_mention(member.id, member.full_name) for member in members)
+    await message.answer(
+        f"欢迎 {mentions}\n钱包已创建，当前余额：<b>0.00</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @router.message(Command("start"), F.chat.type.in_(GROUP_TYPES))
 async def start(message: Message, session_factory) -> None:
     await ensure_participant(message, session_factory)

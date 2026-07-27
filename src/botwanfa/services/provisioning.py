@@ -11,9 +11,10 @@ from botwanfa.db.models import (
     TelegramGroup,
     User,
     Wallet,
-    WalletLedger,
 )
 from botwanfa.domain.bets import BetType
+
+DEFAULT_STARTING_BALANCE = Decimal("0.00")
 
 DEFAULT_ODDS = {
     BetType.BIG: Decimal("2.00"),
@@ -59,7 +60,11 @@ async def provision_participant(
     )
     await session.execute(
         insert(Wallet)
-        .values(group_id=group_id, user_id=user_id, balance=Decimal("1000.00"))
+        .values(
+            group_id=group_id,
+            user_id=user_id,
+            balance=DEFAULT_STARTING_BALANCE,
+        )
         .on_conflict_do_nothing(index_elements=["group_id", "user_id"])
     )
     wallet = await session.scalar(
@@ -67,19 +72,6 @@ async def provision_participant(
     )
     if wallet is None:
         raise RuntimeError("wallet provisioning failed")
-    await session.execute(
-        insert(WalletLedger)
-        .values(
-            wallet_id=wallet.id,
-            idempotency_key=f"initial:{group_id}:{user_id}",
-            entry_type="initial_credit",
-            amount=Decimal("1000.00"),
-            balance_after=wallet.balance,
-            reference_type="group_member",
-            reference_id=user_id,
-        )
-        .on_conflict_do_nothing(index_elements=[WalletLedger.idempotency_key])
-    )
     await session.execute(
         insert(GameSettings)
         .values(group_id=group_id)

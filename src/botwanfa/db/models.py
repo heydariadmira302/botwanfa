@@ -144,6 +144,7 @@ class Round(Base):
     __tablename__ = "rounds"
     __table_args__ = (
         UniqueConstraint("group_id", "round_number"),
+        Index("uq_rounds_public_code", "public_code", unique=True),
         Index(
             "uq_rounds_one_active_per_group",
             "group_id",
@@ -157,6 +158,7 @@ class Round(Base):
         ForeignKey("telegram_groups.id", ondelete="CASCADE"), index=True
     )
     round_number: Mapped[int] = mapped_column(BigInteger)
+    public_code: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32), index=True)
     betting_opens_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     betting_closes_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

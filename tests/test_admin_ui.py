@@ -5,9 +5,16 @@ from botwanfa.apps.admin import (
     _odds_menu_markup,
     admin_menu_markup,
     parse_message_button_input,
+    parse_public_round_code,
+    round_audit_pages,
 )
 from botwanfa.apps.sender import template_message_markup
 from botwanfa.db.models import OddsSetting
+from botwanfa.services.round_audit import (
+    BetAuditItem,
+    PlayerRoundAudit,
+    RoundAuditReport,
+)
 
 
 def odds_row(
@@ -63,6 +70,100 @@ def test_main_player_actions_take_different_paths() -> None:
     assert by_label["🔎 查询玩家"] == "a:us:0"
     assert by_label["💳 玩家上下分"] == "a:gl:0:players"
     assert by_label["🛠 平滑更新"] == "a:dr"
+    assert by_label["🔍 期号查账"] == "a:rs"
+
+
+def test_round_code_is_extracted_from_a_complete_result_message() -> None:
+    code = "da8ea0fba936e6debb130ef5794f0d0c"
+    assert parse_public_round_code(f"🎯 第 {code} 期 · 开奖及结算") == code
+    assert parse_public_round_code("没有期号") is None
+
+
+def test_round_audit_lists_each_bet_and_player_profit() -> None:
+    code = "da8ea0fba936e6debb130ef5794f0d0c"
+    report = RoundAuditReport(
+        public_code=code,
+        group_id=-100123,
+        group_title="测试群",
+        status="completed",
+        dice=(6, 5, 6),
+        dice_source="bot",
+        players=(
+            PlayerRoundAudit(
+                user_id=123,
+                display_name="测试玩家",
+                items=(
+                    BetAuditItem(
+                        bet_type="big",
+                        bet_value="",
+                        amount=Decimal("100.00"),
+                        odds=Decimal("2.00"),
+                        won=True,
+                        payout=Decimal("200.00"),
+                    ),
+                    BetAuditItem(
+                        bet_type="sum",
+                        bet_value="10",
+                        amount=Decimal("50.00"),
+                        odds=Decimal("6.00"),
+                        won=False,
+                        payout=Decimal("0.00"),
+                    ),
+                ),
+                wagered=Decimal("150.00"),
+                returned=Decimal("200.00"),
+                net=Decimal("50.00"),
+                balance_after=Decimal("1050.00"),
+                streak_reward=Decimal("0.00"),
+            ),
+        ),
+    )
+    text = "\n".join(round_audit_pages(report))
+    assert code in text
+    assert "6 - 5 - 6（和值 17）" in text
+    assert "大 100.00 × 2.00 · 赢 · 返还 200.00" in text
+    assert "和值10 50.00 × 6.00 · 输 · 返还 0.00" in text
+    assert "净输赢 <b>+50.00</b>" in text
+    assert "结后余额：<b>1,050.00</b>" in text
+
+
+def test_round_audit_paginates_without_omitting_players() -> None:
+    players = tuple(
+        PlayerRoundAudit(
+            user_id=1000 + index,
+            display_name=f"玩家{index}",
+            items=(
+                BetAuditItem(
+                    bet_type="small_even",
+                    bet_value="",
+                    amount=Decimal("100.00"),
+                    odds=Decimal("4.00"),
+                    won=False,
+                    payout=Decimal("0.00"),
+                ),
+            ),
+            wagered=Decimal("100.00"),
+            returned=Decimal("0.00"),
+            net=Decimal("-100.00"),
+            balance_after=Decimal("900.00"),
+            streak_reward=Decimal("0.00"),
+        )
+        for index in range(60)
+    )
+    report = RoundAuditReport(
+        public_code="a" * 32,
+        group_id=-100123,
+        group_title="分页测试群",
+        status="completed",
+        dice=(1, 2, 3),
+        dice_source="player:1000",
+        players=players,
+    )
+    pages = round_audit_pages(report)
+    combined = "\n".join(pages)
+    assert len(pages) > 1
+    assert all(len(page) <= 3800 for page in pages)
+    assert all(f"tg://user?id={1000 + index}" in combined for index in range(60))
 
 
 def test_odds_menu_has_four_categories_without_page_navigation() -> None:
